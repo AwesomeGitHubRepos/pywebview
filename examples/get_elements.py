@@ -1,17 +1,14 @@
-import webview
-from time import sleep
+"""Get DOM elements using selectors."""
 
-"""
-This example demonstrates how to retrieve a DOM element
-"""
+import webview
 
 
 def get_elements(window):
-    heading = window.get_elements('#heading')
-    content = window.get_elements('.content')
-    print('Heading:\n %s ' % heading[0]['outerHTML'])
-    print('Content 1:\n %s ' % content[0]['outerHTML'])
-    print('Content 2:\n %s ' % content[1]['outerHTML'])
+    heading = window.dom.get_elements('#heading')
+    content = window.dom.get_elements('.content')
+    print(f'Heading:\n {heading[0].node["outerHTML"]}')
+    print(f'Content 1:\n {content[0].node["outerHTML"]}')
+    print(f'Content 2:\n {content[1].node["outerHTML"]}')
 
 
 if __name__ == '__main__':
@@ -25,4 +22,4 @@ if __name__ == '__main__':
       </html>
     """
     window = webview.create_window('Get elements example', html=html)
-    webview.start(get_elements, window, debug=True)
+    webview.start(get_elements, window)

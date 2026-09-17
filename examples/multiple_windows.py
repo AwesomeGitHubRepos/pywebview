@@ -1,14 +1,11 @@
-import webview
-import threading
+"""Create multiple windows."""
 
-"""
-This example demonstrates how to create and manage multiple windows
-"""
+import webview
 
 
 def third_window():
     # Create a new window after the loop started
-    third_window = webview.create_window('Window #3', html='<h1>Third Window</h1>')
+    webview.create_window('Window #3', html='<h1>Third Window</h1>')
 
 
 if __name__ == '__main__':

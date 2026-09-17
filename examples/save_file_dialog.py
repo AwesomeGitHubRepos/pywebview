@@ -1,15 +1,15 @@
-import webview
-import threading
+"""Create a save file dialog after a delay."""
 
-"""
-This example demonstrates creating a save file dialog.
-"""
+import webview
 
 
 def save_file_dialog(window):
     import time
+
     time.sleep(5)
-    result = window.create_file_dialog(webview.SAVE_DIALOG, directory='/', save_filename='test.file')
+    result = window.create_file_dialog(
+        webview.FileDialog.SAVE, directory='/', save_filename='test.file'
+    )
     print(result)
 
 

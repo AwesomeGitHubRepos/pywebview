@@ -1,54 +1,40 @@
 ---
 home: true
+title: pywebview
+tagline: Build GUI for your Python program with JavaScript, HTML, and CSS.
 heroImage: logo.png
-heroText:
-actionText: Get Started →
-actionLink: /guide/
 footer: BSD Licensed | Copyright © 2014–present Roman Sirokov
+actions:
+  - text: Get started
+    icon: mdi:lightbulb-outline
+    link: /guide/
+  - text: API
+    icon: mdi:code-tags
+    link: /api/
+  - text: Examples
+    icon: mdi:star-outline
+    link: /examples/
+
 ---
-<div class='center version'>
-Current version: <strong>4.0.2</strong><br/>
-<a href='/changelog'>What's new</a>
-</div>
+<CurrentVersion version="6.2.1"/>
 
-<br/>
+_pywebview_ is a lightweight BSD-licensed cross-platform wrapper around a webview component. _pywebview_ allows to display HTML content in its own native GUI window. It gives you power of web technologies in your desktop application, hiding the fact that GUI is browser based. _pywebview_ ships with a built-in HTTP server, DOM support in Python and window management functionality.
 
+Get started by [installing _pywebview_](/guide/installation), explore [documentation](/guide/) or [examples](/examples/). If React is your thing, get started right away with [React boilerplate](https://github.com/r0x0r/pywebview-react-boilerplate).
 
 
-# Getting Started
-
-### Install:
-
-``` bash
-pip install pywebview
-```
-
-_On Linux you need additional libraries. Refer to the [installation](/guide/installation.html) page for details._
+<Features/>
 
 
-### Hello world:
-``` python
-import webview
-webview.create_window('Hello world', 'https://pywebview.flowrl.com/')
-webview.start()
-```
+## Sponsors
 
-Explore [documentation](/guide) or [examples](/examples). If React is your thing, get started right away with [React boilerplate](https://github.com/r0x0r/pywebview-react-boilerplate).
+<a href="https://www.testmuai.com/?utm_medium=sponsor&utm_source=pywebview" target="_blank">
+    <img src="https://github.com/r0x0r/pywebview/raw/master/assets/testmuai.svg" style="vertical-align: middle; padding: 1rem 0 8rem 0;" width="250" height="45" />
+</a>
 
-<br/>
 
-# Support the project
+::: center
+Become a financial contributor and help us sustain our community. More donation options are outlined on the [Donating](/contributing/donating.html) page.
 
-If you find _pywebview_ useful, please support it.
-
-<div class="center spc-m spc-bottom">
-    <a href="https://www.patreon.com/bePatron?u=13226105" data-patreon-widget-type="become-patron-button">
-        <img src='https://c5.patreon.com/external/logo/become_a_patron_button.png' alt='Become a Patron!'/>
-    </a>
-</div>
-
-<div class="center spc-l spc-vertical">
-	<a href="https://opencollective.com/pywebview/donate" target="_blank">
-		<img src="https://opencollective.com/pywebview/donate/button@2x.png?color=blue" width=300 />
-	</a>
-</div>
+![Github Sponsor](/github_sponsor_button.png)
+:::

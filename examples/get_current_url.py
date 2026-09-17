@@ -1,8 +1,6 @@
-import webview
+"""Print current URL after page is loaded."""
 
-"""
-This example demonstrates how to get the current url loaded in the webview.
-"""
+import webview
 
 
 def get_current_url(window):

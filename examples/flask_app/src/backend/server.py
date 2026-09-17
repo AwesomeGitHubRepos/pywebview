@@ -3,9 +3,10 @@ import os
 import webbrowser
 from functools import wraps
 
-from flask import Flask, render_template, jsonify, request
-import webview
 import app
+from flask import Flask, jsonify, render_template, request
+
+import webview
 
 gui_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'gui')  # development path
 
@@ -46,10 +47,10 @@ def landing():
 @server.route('/init', methods=['POST'])
 @verify_token
 def initialize():
-    '''
+    """
     Perform heavy-lifting initialization asynchronously.
     :return:
-    '''
+    """
     can_start = app.initialize()
 
     if can_start:
@@ -57,9 +58,7 @@ def initialize():
             'status': 'ok',
         }
     else:
-        response = {
-            'status': 'error'
-        }
+        response = {'status': 'error'}
 
     return jsonify(response)
 
@@ -67,11 +66,11 @@ def initialize():
 @server.route('/choose/path', methods=['POST'])
 @verify_token
 def choose_path():
-    '''
+    """
     Invoke a folder selection dialog here
     :return:
-    '''
-    dirs = webview.windows[0].create_file_dialog(webview.FOLDER_DIALOG)
+    """
+    dirs = webview.windows[0].create_file_dialog(webview.FileDialog.FOLDER)
     if dirs and len(dirs) > 0:
         directory = dirs[0]
         if isinstance(directory, bytes):

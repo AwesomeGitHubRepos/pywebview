@@ -1,8 +1,14 @@
+"""
+Run pywebview alongside with pystray to display a system tray icon.
+"""
+
+import multiprocessing
+import sys
+
 from PIL import Image
 from pystray import Icon, Menu, MenuItem
+
 import webview
-import sys
-import multiprocessing
 
 if sys.platform == 'darwin':
     ctx = multiprocessing.get_context('spawn')
@@ -13,16 +19,11 @@ else:
     Queue = multiprocessing.Queue
 
 
-"""
-This example demonstrates running pywebview alongside with pystray to display a system tray icon.
-"""
-
-
 webview_process = None
 
 
 def run_webview():
-    window = webview.create_window('Webview', 'https://pywebview.flowrl.com/hello')
+    webview.create_window('Webview', 'https://pywebview.flowrl.com/hello')
     webview.start()
 
 
@@ -43,7 +44,7 @@ if __name__ == '__main__':
 
     start_webview_process()
 
-    image = Image.open('logo/logo.png')
+    image = Image.open('assets/logo.png')
     menu = Menu(MenuItem('Open', on_open), MenuItem('Exit', on_exit))
     icon = Icon('Pystray', image, menu=menu)
     icon.run()

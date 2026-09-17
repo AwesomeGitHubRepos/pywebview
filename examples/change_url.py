@@ -1,10 +1,10 @@
-import webview
+"""
+Change URL ten seconds after the first URL is loaded.
+"""
+
 import time
 
-"""
-This example demonstrates how a webview window is created and URL is changed
-after 10 seconds.
-"""
+import webview
 
 
 def change_url(window):

@@ -1,77 +1,101 @@
-'''
-(C) 2014-2019 Roman Sirokov and contributors
-Licensed under BSD license
-
-http://github.com/r0x0r/pywebview/
-'''
-
-import os
-import platform
 import json
 import logging
-import webbrowser
+import os
+import platform
+import signal
 import socket
 import sys
-
-from uuid import uuid1
+import webbrowser
 from copy import copy, deepcopy
-from threading import Semaphore, Event, Thread
-import typing as t
+from functools import partial
+from threading import Event, Semaphore, Thread
+from uuid import uuid1
 
-from webview import _debug, _user_agent, _private_mode, _storage_path, OPEN_DIALOG, FOLDER_DIALOG, SAVE_DIALOG, windows
-from webview.window import Window, FixPoint
-from webview.util import create_cookie, default_html, parse_api_js, js_bridge_call
-from webview.js.css import disable_text_select
-from webview.screen import Screen
-from webview.window import FixPoint
+from qtpy import PYQT6, PYSIDE6, QtCore
+from qtpy.QtCore import QByteArray, QJsonValue
+from qtpy.QtGui import QColor, QIcon, QScreen
+from qtpy.QtWidgets import QAction, QApplication, QFileDialog, QMainWindow, QMenuBar, QMessageBox
+
+from webview import FileDialog, _state, settings, windows
+from webview.dom import _dnd_state
 from webview.menu import Menu, MenuAction, MenuSeparator
-
-
-logger = logging.getLogger('pywebview')
-
-settings = {}
-
-from qtpy import QtCore
-
-logger.debug('Using Qt %s' % QtCore.__version__)
-
-from qtpy.QtWidgets import QMainWindow, QApplication, QFileDialog, QMessageBox, QAction, QMenuBar
-from qtpy.QtGui import QColor, QScreen
-from qtpy import PYQT6, PYSIDE6
+from webview.models import Request
+from webview.screen import Screen
+from webview.util import (
+    DEFAULT_HTML,
+    create_cookie,
+    environ_append,
+    inject_pywebview,
+    js_bridge_call,
+)
+from webview.window import FixPoint, Window
 
 try:
-    from qtpy.QtWebEngineWidgets import QWebEngineView as QWebView, QWebEnginePage as QWebPage, QWebEngineProfile
+    from qtpy.QtNetwork import QSslCertificate, QSslConfiguration
     from qtpy.QtWebChannel import QWebChannel
-    from qtpy.QtNetwork import QSslConfiguration, QSslCertificate
+    from qtpy.QtWebEngineCore import QWebEngineUrlRequestInterceptor
+    from qtpy.QtWebEngineWidgets import QWebEnginePage as QWebPage
+    from qtpy.QtWebEngineWidgets import QWebEngineProfile, QWebEngineSettings
+    from qtpy.QtWebEngineWidgets import QWebEngineView as QWebView
+
     renderer = 'qtwebengine'
     is_webengine = True
 except ImportError:
-    from PyQt5 import QtWebKitWidgets
-    from PyQt5.QtWebKitWidgets import QWebView, QWebPage
-    from PyQt5.QtNetwork import QSslConfiguration, QSslCertificate
+    from PyQt5.QtNetwork import QSslCertificate, QSslConfiguration
+    from PyQt5.QtWebKitWidgets import QWebPage, QWebView
+
     is_webengine = False
     renderer = 'qtwebkit'
 
+logger = logging.getLogger('pywebview')
+logger.debug(f'Using Qt {QtCore.__version__}')
+
+if is_webengine and QtCore.QSysInfo.productType() in ['arch', 'manjaro', 'nixos', 'rhel', 'pop']:
+    # I don't know why, but it's a common solution for #890 (White screen displayed)
+    # such as:
+    # - https://github.com/LCA-ActivityBrowser/activity-browser/pull/954/files
+    # - https://bugs.archlinux.org/task/73957
+    # - https://www.google.com/search?q=arch+rstudio+no+sandbox
+    # And sometimes it needs two "--no-sandbox" flags
+
+    environ_append('QTWEBENGINE_CHROMIUM_FLAGS', '--no-sandbox', '--no-sandbox')
+    logger.debug('Enable --no-sandbox flag for arch/manjaro/nixos')
+
+_app_menu = None
 _main_window_created = Event()
 _main_window_created.clear()
 
 # suppress invalid style override error message on some Linux distros
 os.environ['QT_STYLE_OVERRIDE'] = ''
 _qt6 = True if PYQT6 or PYSIDE6 else False
-_profile_storage_path = _storage_path or os.path.join(os.path.expanduser('~'), '.pywebview')
+_profile_storage_path = _state['storage_path'] or os.path.join(
+    os.path.expanduser('~'), '.pywebview'
+)
+
+
+def _sigint_handler(signum, frame):
+    """
+    Handler for SIGINT signal (Ctrl+C).
+
+    Qt applications don't handle SIGINT by default because Python signal handlers
+    can only be called when the Python interpreter is running. Since the Qt event
+    loop runs in C++, signals are noted but handlers aren't called until Python
+    code executes. The timer in create_window() ensures the Python interpreter
+    runs periodically to process pending signals.
+
+    See: https://stackoverflow.com/a/4939113
+    """
+    global _app
+    if _app:
+        _app.quit()
 
 
 class BrowserView(QMainWindow):
     instances = {}
     inspector_port = None  # The localhost port at which the Remote debugger listens
 
-    # In case we don't have native menubar, we have to save the top level menus and add them
-    #     to each window's bar menu
-    global_menubar_top_menus = []
-    # If we don't save the rest of these, then QApplication can't access them
     global_menubar_other_objects = []
-    # The first QMenuBar created
-    global_menubar = None
+    global_menubar_top_menus = []
 
     create_window_trigger = QtCore.Signal(object)
     set_title_trigger = QtCore.Signal(str)
@@ -85,6 +109,7 @@ class BrowserView(QMainWindow):
     fullscreen_trigger = QtCore.Signal()
     window_size_trigger = QtCore.Signal(int, int, FixPoint)
     window_move_trigger = QtCore.Signal(int, int)
+    window_maximize_trigger = QtCore.Signal()
     window_minimize_trigger = QtCore.Signal()
     window_restore_trigger = QtCore.Signal()
     current_url_trigger = QtCore.Signal()
@@ -94,19 +119,24 @@ class BrowserView(QMainWindow):
     class JSBridge(QtCore.QObject):
         qtype = QtCore.QJsonValue if is_webengine else str
 
-        def __init__(self):
-            super(BrowserView.JSBridge, self).__init__()
+        def __init__(self, parent):
+            super().__init__()
+            self._parent = parent
+            self.window = parent.pywebview_window
 
-        @QtCore.Slot(str, qtype, str, result=str)
-        def call(self, func_name, param, value_id):
+        @QtCore.Slot(str, qtype, str, str, result=str)
+        def call(self, func_name, param, value_id, token):
             func_name = BrowserView._convert_string(func_name)
             param = BrowserView._convert_string(param)
 
-            return js_bridge_call(self.window, func_name, json.loads(param), value_id)
+            if func_name == '_pywebviewAlert':
+                QMessageBox.information(self._parent, 'Message', str(param))
+            else:
+                return js_bridge_call(self.window, func_name, json.loads(param), value_id, token)
 
     class WebView(QWebView):
         def __init__(self, parent=None):
-            super(BrowserView.WebView, self).__init__(parent)
+            super().__init__(parent)
 
             if parent.frameless and parent.easy_drag:
                 QApplication.instance().installEventFilter(self)
@@ -116,7 +146,7 @@ class BrowserView(QMainWindow):
             if parent.transparent:
                 self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
                 self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, False)
-                self.setStyleSheet("background: transparent;")
+                self.setStyleSheet('background: transparent;')
 
         def contextMenuEvent(self, event):
             if _qt6:
@@ -138,6 +168,29 @@ class BrowserView(QMainWindow):
 
             menu.exec_(event.globalPos())
 
+        def dragEnterEvent(self, e):
+            if e.mimeData().hasUrls and _dnd_state['num_listeners'] > 0:
+                e.acceptProposedAction()
+
+            return super().dragEnterEvent(e)
+
+        def dragMoveEvent(self, e):
+            if e.mimeData().hasUrls and _dnd_state['num_listeners'] > 0:
+                e.acceptProposedAction()
+
+            return super().dragMoveEvent(e)
+
+        def dropEvent(self, e):
+            if e.mimeData().hasUrls and _dnd_state['num_listeners'] > 0:
+                files = [
+                    (os.path.basename(value.toString()), value.toString().replace('file://', ''))
+                    for value in e.mimeData().urls()
+                    if value.toString().startswith('file://')
+                ]
+                _dnd_state['paths'] += files
+
+            return super().dropEvent(e)
+
         # Create a new webview window pointing at the Remote debugger server
         def show_inspector(self):
             uid = self.parent().uid + '-inspector'
@@ -146,9 +199,8 @@ class BrowserView(QMainWindow):
                 BrowserView.instances[uid].raise_()
                 BrowserView.instances[uid].activateWindow()
             except KeyError:
-                title = 'Web Inspector - {}'.format(self.parent().title)
-                url = 'http://localhost:{}'.format(BrowserView.inspector_port)
-                print(url)
+                title = f'Web Inspector - {self.parent().title}'
+                url = f'http://localhost:{BrowserView.inspector_port}'
                 window = Window('web_inspector', title, url, '', 700, 500)
                 window.localization = self.parent().localization
 
@@ -163,7 +215,9 @@ class BrowserView(QMainWindow):
 
         def mouseMoveEvent(self, event):
             parent = self.parent()
-            if parent.frameless and parent.easy_drag and int(event.buttons()) == 1:  # left button is pressed
+            if (
+                parent.frameless and parent.easy_drag and event.buttons() & QtCore.Qt.LeftButton
+            ):  # left button is pressed
                 parent.move(event.globalPos() - self.drag_pos)
 
         def eventFilter(self, object, event):
@@ -175,21 +229,55 @@ class BrowserView(QMainWindow):
 
             return False
 
+    class RequestInterceptor(QWebEngineUrlRequestInterceptor):
+        def __init__(self, window):
+            super().__init__()
+            self.window = window
+
+        def interceptRequest(self, info):
+            if len(self.window.events.request_sent) == 0:
+                return
+
+            url = info.requestUrl().toString()
+            method = info.requestMethod()
+
+            if 'httpHeaders' in dir(info):
+                headers = {
+                    k.data().decode('utf-8'): v.data().decode('utf-8')
+                    for k, v in info.httpHeaders().items()
+                }
+            else:
+                headers = {}
+
+            request = Request(url, method, headers)
+            self.window.events.request_sent.set(request)
+
+            if request.headers != headers:
+                for key, value in request.headers.items():
+                    info.setHttpHeader(
+                        QByteArray(key.encode('utf-8')), QByteArray(value.encode('utf-8'))
+                    )
+
     # New-window-requests handler for Qt 5.5+ only
     class NavigationHandler(QWebPage):
-        def __init__(self, parent=None):
-            super(BrowserView.NavigationHandler, self).__init__(parent)
+        def __init__(self, page):
+            super().__init__(page.profile())
+            self._parent = page.parent
 
         def acceptNavigationRequest(self, url, type, is_main_frame):
-            webbrowser.open(url.toString(), 2, True)
-            return False
+            if settings['OPEN_EXTERNAL_LINKS_IN_BROWSER']:
+                webbrowser.open(url.toString(), 2, True)
+                return False
+            else:
+                self._parent.load_url(url.toString())
+                return True
 
     class WebPage(QWebPage):
         def __init__(self, parent=None, profile=None):
             if is_webengine and profile:
-                super(BrowserView.WebPage, self).__init__(profile, parent)
+                super().__init__(profile, parent.webview)
             else:
-                super(BrowserView.WebPage, self).__init__(parent)
+                super().__init__(parent.webview)
 
             if is_webengine:
                 self.featurePermissionRequested.connect(self.onFeaturePermissionRequested)
@@ -201,16 +289,18 @@ class BrowserView(QMainWindow):
                 self.setBackgroundColor(QtCore.Qt.transparent)
 
         if is_webengine:
+
             def onFeaturePermissionRequested(self, url, feature):
                 if feature in (
-                    QWebPage.MediaAudioCapture,
-                    QWebPage.MediaVideoCapture,
-                    QWebPage.MediaAudioVideoCapture,
+                    QWebPage.Feature.MediaAudioCapture,
+                    QWebPage.Feature.MediaVideoCapture,
+                    QWebPage.Feature.MediaAudioVideoCapture,
                 ):
-                    self.setFeaturePermission(url, feature, QWebPage.PermissionGrantedByUser)
+                    self.setFeaturePermission(url, feature, 1)  # QWebPage.PermissionGrantedByUser
                 else:
-                    self.setFeaturePermission(url, feature, QWebPage.PermissionDeniedByUser)
+                    self.setFeaturePermission(url, feature, 2)  # QWebPage.PermissionDeniedByUser
         else:
+
             def acceptNavigationRequest(self, frame, request, type):
                 if frame is None:
                     webbrowser.open(request.url().toString(), 2, True)
@@ -218,7 +308,7 @@ class BrowserView(QMainWindow):
                 return True
 
         def userAgentForUrl(self, url):
-            user_agent = settings.get('user_agent') or _user_agent
+            user_agent = _state['user_agent']
             if user_agent:
                 return user_agent
             else:
@@ -228,25 +318,31 @@ class BrowserView(QMainWindow):
             return self.nav_handler
 
     def __init__(self, window):
-        super(BrowserView, self).__init__()
+        super().__init__()
         BrowserView.instances[window.uid] = self
         self.uid = window.uid
         self.pywebview_window = window
+        self.pywebview_window.native = self
 
-        self.js_bridge = BrowserView.JSBridge()
-        self.js_bridge.window = window
+        self.js_bridge = BrowserView.JSBridge(self)
 
         self.is_fullscreen = False
-        self.confirm_close = window.confirm_close
-        self.text_select = window.text_select
 
         self._file_name_semaphore = Semaphore(0)
         self._current_url_semaphore = Semaphore(0)
 
-        self.loaded = window.events.loaded
-        self.shown = window.events.shown
-
         self.localization = window.localization
+
+        if window.screen:
+            if _qt6:
+                self.screen = QScreen.geometry(window.screen.frame)
+            else:
+                self.screen = window.screen.frame.geometry()
+        else:
+            if _qt6:
+                self.screen = QScreen.geometry(QApplication.primaryScreen())
+            else:
+                self.screen = QApplication.primaryScreen().geometry()
 
         self._js_results = {}
         self._current_url = None
@@ -278,7 +374,12 @@ class BrowserView(QMainWindow):
         if window.on_top:
             flags = flags | QtCore.Qt.WindowStaysOnTopHint
 
+        if not window.focus:
+            self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
+            flags = flags | QtCore.Qt.WindowDoesNotAcceptFocus
+
         self.setWindowFlags(flags)
+        self.setAcceptDrops(True)
 
         self.transparent = window.transparent
         if self.transparent:
@@ -290,38 +391,65 @@ class BrowserView(QMainWindow):
             # Enable the transparency hint
             self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
 
-        self.view = BrowserView.WebView(self)
+        self.webview = BrowserView.WebView(self)
 
         if is_webengine:
-            os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
-                '--use-fake-ui-for-media-stream --enable-features=AutoplayIgnoreWebAudio')
+            environ_append(
+                'QTWEBENGINE_CHROMIUM_FLAGS',
+                '--use-fake-ui-for-media-stream',
+                '--enable-features=AutoplayIgnoreWebAudio',
+            )
 
-        if _debug['mode'] and is_webengine:
+        if _state['debug'] and is_webengine:
             # Initialise Remote debugging (need to be done only once)
             if not BrowserView.inspector_port:
                 BrowserView.inspector_port = BrowserView._get_debug_port()
                 os.environ['QTWEBENGINE_REMOTE_DEBUGGING'] = BrowserView.inspector_port
         else:
-            self.view.setContextMenuPolicy(QtCore.Qt.NoContextMenu)  # disable right click context menu
+            self.webview.setContextMenuPolicy(
+                QtCore.Qt.NoContextMenu
+            )  # disable right click context menu
 
+        self.cookies = {}
 
         if is_webengine:
-            if _private_mode:
+            self.request_interceptor = BrowserView.RequestInterceptor(self.pywebview_window)
+
+            if _state['private_mode']:
                 self.profile = QWebEngineProfile()
             else:
                 self.profile = QWebEngineProfile('pywebview')
                 self.profile.setPersistentStoragePath(_profile_storage_path)
-                self.cookies = {}
-                cookie_store = self.profile.cookieStore()
-                cookie_store.cookieAdded.connect(self.on_cookie_added)
-                cookie_store.cookieRemoved.connect(self.on_cookie_removed)
 
-                self.view.setPage(BrowserView.WebPage(self.view, profile=self.profile))
-        elif not is_webengine and not _private_mode:
-            logger.warning('qtwebkit does not support _private_mode=False')
+            user_agent = _state['user_agent']
+            if user_agent:
+                self.profile.setHttpUserAgent(user_agent)
 
-        self.view.page().loadFinished.connect(self.on_load_finished)
-        self.setCentralWidget(self.view)
+            cookie_store = self.profile.cookieStore()
+            cookie_store.cookieAdded.connect(self.on_cookie_added)
+            cookie_store.cookieRemoved.connect(self.on_cookie_removed)
+
+            self.profile.setUrlRequestInterceptor(self.request_interceptor)
+            self.webview.setPage(BrowserView.WebPage(self, profile=self.profile))
+        elif not is_webengine and not _state['private_mode']:
+            logger.warning('qtwebkit does not support private_mode')
+
+        user_agent = _state['user_agent']
+        # if user_agent and is_webengine:
+        #     self.profile.setHttpUserAgent(user_agent)
+
+        if is_webengine:
+            self.profile.settings().setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,
+                settings['ALLOW_FILE_URLS'],
+            )
+
+        self.webview.page().loadFinished.connect(self.on_load_finished)
+
+        if settings['ALLOW_DOWNLOADS']:
+            self.webview.page().profile().downloadRequested.connect(self.on_download_requested)
+
+        self.setCentralWidget(self.webview)
 
         self.create_window_trigger.connect(BrowserView.on_create_window)
         self.load_url_trigger.connect(self.on_load_url)
@@ -334,6 +462,7 @@ class BrowserView(QMainWindow):
         self.fullscreen_trigger.connect(self.on_fullscreen)
         self.window_size_trigger.connect(self.on_window_size)
         self.window_move_trigger.connect(self.on_window_move)
+        self.window_maximize_trigger.connect(self.on_window_maximize)
         self.window_minimize_trigger.connect(self.on_window_minimize)
         self.window_restore_trigger.connect(self.on_window_restore)
         self.current_url_trigger.connect(self.on_current_url)
@@ -342,44 +471,46 @@ class BrowserView(QMainWindow):
         self.on_top_trigger.connect(self.on_set_on_top)
 
         if is_webengine and platform.system() != 'OpenBSD':
-            self.channel = QWebChannel(self.view.page())
-            self.view.page().setWebChannel(self.channel)
+            self.channel = QWebChannel(self.webview.page())
+            self.webview.page().setWebChannel(self.channel)
 
         if window.fullscreen:
             self.toggle_fullscreen()
 
         if window.real_url is not None:
-            self.view.setUrl(QtCore.QUrl(window.real_url))
+            self.webview.setUrl(QtCore.QUrl(window.real_url))
         elif window.uid == 'web_inspector':
-            self.view.setUrl(QtCore.QUrl(window.original_url))
+            self.webview.setUrl(QtCore.QUrl(window.original_url))
         elif window.html:
-            self.view.setHtml(window.html, QtCore.QUrl(''))
+            self.webview.setHtml(window.html, QtCore.QUrl(''))
         else:
-            self.view.setHtml(default_html, QtCore.QUrl(''))
+            self.webview.setHtml(DEFAULT_HTML, QtCore.QUrl(''))
 
         if window.initial_x is not None and window.initial_y is not None:
-            self.move(window.initial_x, window.initial_y)
+            self.move(self.screen.x() + window.initial_x, self.screen.y() + window.initial_y)
         else:
-            if _qt6:
-                center = QScreen.availableGeometry(QApplication.primaryScreen()).center() - self.rect().center()
-                self.move(center.x(), center.y() - 16)
-            else:
-                center = QApplication.desktop().availableGeometry().center() - self.rect().center()
-                self.move(center.x(), center.y())
+            offset = -16 if _qt6 else 0
+            center = self.screen.center() - self.rect().center()
+            self.move(center.x(), center.y() + offset)
 
         if not window.minimized:
             self.activateWindow()
             self.raise_()
 
-        self.shown.set()
+        if _state['icon']:
+            icon = QIcon(_state['icon'])
+            self.setWindowIcon(icon)
+
+        self.pywebview_window.events.before_show.set()
 
     def on_set_title(self, title):
         self.setWindowTitle(title)
 
     def on_confirmation_dialog(self, title, message, uuid):
         uuid_ = BrowserView._convert_string(uuid)
-        reply = QMessageBox.question(self, title, message,
-                                         QMessageBox.Cancel, QMessageBox.Ok)
+        reply = QMessageBox.question(
+            self, title, message, QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel
+        )
 
         confirmation_dialog_result = self._confirmation_dialog_results[uuid_]
 
@@ -390,18 +521,29 @@ class BrowserView(QMainWindow):
         confirmation_dialog_result['semaphore'].release()
 
     def on_file_dialog(self, dialog_type, directory, allow_multiple, save_filename, file_filter):
-        if dialog_type == FOLDER_DIALOG:
-            self._file_name = QFileDialog.getExistingDirectory(self, self.localization['linux.openFolder'], options=QFileDialog.ShowDirsOnly)
-        elif dialog_type == OPEN_DIALOG:
+        if dialog_type == FileDialog.FOLDER:
+            self._file_name = QFileDialog.getExistingDirectory(
+                self,
+                self.localization['linux.openFolder'],
+                directory,
+                options=QFileDialog.ShowDirsOnly,
+            )
+        elif dialog_type == FileDialog.OPEN:
             if allow_multiple:
-                self._file_name = QFileDialog.getOpenFileNames(self, self.localization['linux.openFiles'], directory, file_filter)
+                self._file_name = QFileDialog.getOpenFileNames(
+                    self, self.localization['linux.openFiles'], directory, file_filter
+                )
             else:
-                self._file_name = QFileDialog.getOpenFileName(self, self.localization['linux.openFile'], directory, file_filter)
-        elif dialog_type == SAVE_DIALOG:
+                self._file_name = QFileDialog.getOpenFileName(
+                    self, self.localization['linux.openFile'], directory, file_filter
+                )
+        elif dialog_type == FileDialog.SAVE:
             if directory:
                 save_filename = os.path.join(str(directory), str(save_filename))
 
-            self._file_name = QFileDialog.getSaveFileName(self, self.localization['global.saveFile'], save_filename)
+            self._file_name = QFileDialog.getSaveFileName(
+                self, self.localization['global.saveFile'], save_filename
+            )
 
         self._file_name_semaphore.release()
 
@@ -412,7 +554,6 @@ class BrowserView(QMainWindow):
         if raw not in self.cookies:
             self.cookies[raw] = cookie
 
-
     def on_cookie_removed(self, cookie):
         raw = str(cookie.toRawForm(), 'utf-8')
 
@@ -420,15 +561,15 @@ class BrowserView(QMainWindow):
             del self.cookies[raw]
 
     def on_current_url(self):
-        url = BrowserView._convert_string(self.view.url().toString())
+        url = BrowserView._convert_string(self.webview.url().toString())
         self._current_url = None if url == '' or url.startswith('data:text/html') else url
         self._current_url_semaphore.release()
 
     def on_load_url(self, url):
-        self.view.setUrl(QtCore.QUrl(url))
+        self.webview.setUrl(QtCore.QUrl(url))
 
     def on_load_html(self, content, base_uri):
-        self.view.setHtml(content, QtCore.QUrl(base_uri))
+        self.webview.setHtml(content, QtCore.QUrl(base_uri))
 
     def on_set_on_top(self, top):
         flags = self.windowFlags()
@@ -439,29 +580,40 @@ class BrowserView(QMainWindow):
 
         self.show()
 
+    def showEvent(self, event):
+        self.pywebview_window.events.shown.set()
+
     def closeEvent(self, event):
-        if self.confirm_close:
-            reply = QMessageBox.question(self, self.title, self.localization['global.quitConfirmation'],
-                                         QMessageBox.Yes, QMessageBox.No)
-
-            if reply == QMessageBox.No:
-                event.ignore()
-                return
-
         should_cancel = self.pywebview_window.events.closing.set()
 
         if should_cancel:
             event.ignore()
             return
 
+        if self.pywebview_window.confirm_close:
+            reply = QMessageBox.question(
+                self,
+                self.title,
+                self.localization['global.quitConfirmation'],
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+
+            if reply == QMessageBox.No:
+                event.ignore()
+                return
+
         event.accept()
-        BrowserView.instances[self.uid].close()
+
         del BrowserView.instances[self.uid]
 
         if self.pywebview_window in windows:
             windows.remove(self.pywebview_window)
 
         self.pywebview_window.events.closed.set()
+
+        if self.webview.page():
+            self.webview.page().deleteLater()
 
         if len(BrowserView.instances) == 0:
             self.hide()
@@ -477,12 +629,17 @@ class BrowserView(QMainWindow):
         if self.windowState() == QtCore.Qt.WindowMaximized:
             self.pywebview_window.events.maximized.set()
 
-        if self.windowState() == QtCore.Qt.WindowNoState and e.oldState() in (QtCore.Qt.WindowMinimized, QtCore.Qt.WindowMaximized):
+        if self.windowState() == QtCore.Qt.WindowNoState and e.oldState() in (
+            QtCore.Qt.WindowMinimized,
+            QtCore.Qt.WindowMaximized,
+        ):
             self.pywebview_window.events.restored.set()
 
     def resizeEvent(self, e):
-        if self.pywebview_window.initial_width != self.width() or \
-           self.pywebview_window.initial_height != self.height():
+        if (
+            self.pywebview_window.initial_width != self.width()
+            or self.pywebview_window.initial_height != self.height()
+        ):
             self.pywebview_window.events.resized.set(self.width(), self.height())
 
     def eventFilter(self, object, event):
@@ -519,11 +676,18 @@ class BrowserView(QMainWindow):
             # Keep the top of the window in the same place
             geo.setY(geo.y() + geo.height() - height)
 
+        geo.setWidth(width)
+        geo.setHeight(height)
         self.setGeometry(geo)
-        self.setFixedSize(width, height)
+
+        if not self.pywebview_window.resizable:
+            self.setFixedSize(width, height)
 
     def on_window_move(self, x, y):
         self.move(x, y)
+
+    def on_window_maximize(self):
+        self.setWindowState(QtCore.Qt.WindowMaximized)
 
     def on_window_minimize(self):
         self.setWindowState(QtCore.Qt.WindowMinimized)
@@ -534,23 +698,37 @@ class BrowserView(QMainWindow):
         self.activateWindow()
 
     def on_evaluate_js(self, script, uuid):
-        def return_result(result):
-            result = BrowserView._convert_string(result)
+        def return_result(result_):
+            result = BrowserView._convert_string(result_)
             uuid_ = BrowserView._convert_string(uuid)
 
             js_result = self._js_results[uuid_]
-            js_result['result'] = None if result is None or result == 'null' else result if result == '' else json.loads(result)
+
+            if js_result['parse_json'] and result:
+                try:
+                    js_result['result'] = json.loads(result)
+                except Exception:
+                    logger.exception('Failed to parse JSON: %s', result)
+                    js_result['result'] = result
+            else:
+                js_result['result'] = result
+
             js_result['semaphore'].release()
 
-        try:    # < Qt5.6
+        try:  # < Qt5.6
             if _qt6:
-                self.view.page().runJavaScript(script, 0, return_result)
+                self.webview.page().runJavaScript(script, 0, return_result)
             else:
-                self.view.page().runJavaScript(script, return_result)
+                self.webview.page().runJavaScript(script, return_result)
         except TypeError:
-            self.view.page().runJavaScript(script)  # PySide2 & PySide6
+            # Some PySide2 & PySide6 versions raise TypeError when a Python
+            # callable is passed as the result callback. Fire the script
+            # without one, and unblock the waiting caller with no result
+            # instead of leaving it blocked on the semaphore forever.
+            self.webview.page().runJavaScript(script)
+            return_result(None)
         except AttributeError:
-            result = self.view.page().mainFrame().evaluateJavaScript(script)
+            result = self.webview.page().mainFrame().evaluateJavaScript(script)
             return_result(result)
         except Exception as e:
             logger.exception(e)
@@ -561,16 +739,18 @@ class BrowserView(QMainWindow):
 
         self._set_js_api()
 
-        if not self.text_select:
-            script = disable_text_select.replace('\n', '')
+        if _state['debug'] and settings['OPEN_DEVTOOLS_IN_DEBUG']:
+            self.webview.show_inspector()
 
-            try:
-                self.view.page().runJavaScript(script)
-            except: # QT < 5.6
-                self.view.page().mainFrame().evaluateJavaScript(script)
-
-        if _debug['mode']:
-            self.view.show_inspector()
+    def on_download_requested(self, download):
+        old_path = download.url().path()
+        suffix = QtCore.QFileInfo(old_path).suffix()
+        path, _ = QFileDialog.getSaveFileName(
+            self, self.localization['global.saveFile'], old_path, '*.' + suffix
+        )
+        if path:
+            download.setPath(path)
+            download.accept()
 
     def set_title(self, title):
         self.set_title_trigger.emit(title)
@@ -578,25 +758,29 @@ class BrowserView(QMainWindow):
     def get_cookies(self):
         return list(self.cookies.values())
 
+    def clear_cookies(self):
+        self.cookies = {}
+        self.profile.cookieStore().deleteAllCookies()
+
     def get_current_url(self):
-        self.loaded.wait()
         self.current_url_trigger.emit()
         self._current_url_semaphore.acquire()
 
         return self._current_url
 
     def load_url(self, url):
-        self.loaded.clear()
         self.load_url_trigger.emit(url)
 
     def load_html(self, content, base_uri):
-        self.loaded.clear()
         self.html_trigger.emit(content, base_uri)
 
     def create_confirmation_dialog(self, title, message):
         result_semaphore = Semaphore(0)
         unique_id = uuid1().hex
-        self._confirmation_dialog_results[unique_id] = {'semaphore': result_semaphore, 'result': None}
+        self._confirmation_dialog_results[unique_id] = {
+            'semaphore': result_semaphore,
+            'result': None,
+        }
 
         self.confirmation_dialog_trigger.emit(title, message, unique_id)
         result_semaphore.acquire()
@@ -606,13 +790,17 @@ class BrowserView(QMainWindow):
 
         return result
 
-    def create_file_dialog(self, dialog_type, directory, allow_multiple, save_filename, file_filter):
-        self.file_dialog_trigger.emit(dialog_type, directory, allow_multiple, save_filename, file_filter)
+    def create_file_dialog(
+        self, dialog_type, directory, allow_multiple, save_filename, file_filter
+    ):
+        self.file_dialog_trigger.emit(
+            dialog_type, directory, allow_multiple, save_filename, file_filter
+        )
         self._file_name_semaphore.acquire()
 
-        if dialog_type == FOLDER_DIALOG:
+        if dialog_type == FileDialog.FOLDER:
             file_names = (self._file_name,)
-        elif dialog_type == SAVE_DIALOG or not allow_multiple:
+        elif dialog_type == FileDialog.SAVE or not allow_multiple:
             file_names = (self._file_name[0],)
         else:
             file_names = tuple(self._file_name[0])
@@ -641,6 +829,9 @@ class BrowserView(QMainWindow):
     def move_window(self, x, y):
         self.window_move_trigger.emit(x, y)
 
+    def maximize(self):
+        self.window_maximize_trigger.emit()
+
     def minimize(self):
         self.window_minimize_trigger.emit()
 
@@ -650,11 +841,14 @@ class BrowserView(QMainWindow):
     def set_on_top(self, top):
         self.on_top_trigger.emit(top)
 
-    def evaluate_js(self, script):
-        self.loaded.wait()
+    def evaluate_js(self, script, parse_json):
         result_semaphore = Semaphore(0)
         unique_id = uuid1().hex
-        self._js_results[unique_id] = {'semaphore': result_semaphore, 'result': ''}
+        self._js_results[unique_id] = {
+            'semaphore': result_semaphore,
+            'result': '',
+            'parse_json': parse_json,
+        }
 
         self.evaluate_js_trigger.emit(script, unique_id)
         result_semaphore.acquire()
@@ -668,38 +862,25 @@ class BrowserView(QMainWindow):
         def _register_window_object():
             frame.addToJavaScriptWindowObject('external', self.js_bridge)
 
-        code = 'qtwebengine' if is_webengine else 'qtwebkit'
-        script = parse_api_js(self.js_bridge.window, code)
-
         if is_webengine:
             qwebchannel_js = QtCore.QFile('://qtwebchannel/qwebchannel.js')
             if qwebchannel_js.open(QtCore.QFile.ReadOnly):
                 source = bytes(qwebchannel_js.readAll()).decode('utf-8')
-                self.view.page().runJavaScript(source)
+                self.webview.page().runJavaScript(source)
                 self.channel.registerObject('external', self.js_bridge)
                 qwebchannel_js.close()
         else:
-            frame = self.view.page().mainFrame()
+            frame = self.webview.page().mainFrame()
             _register_window_object()
 
-        try:
-            self.view.page().runJavaScript(script)
-        except AttributeError:  # < QT 5.6
-            self.view.page().mainFrame().evaluateJavaScript(script)
-
-        self.loaded.set()
+        inject_pywebview(renderer, self.js_bridge.window)
 
     @staticmethod
     def _convert_string(result):
-        try:
-            if result is None or result.isNull():
-                return None
-
-            result = result.toString() # QJsonValue conversion
-        except AttributeError:
-            pass
-
-        return str(result)
+        if isinstance(result, QJsonValue):
+            return None if result.isNull() else result.toString()
+        else:
+            return result
 
     @staticmethod
     def _get_debug_port():
@@ -716,9 +897,9 @@ class BrowserView(QMainWindow):
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.bind(('localhost', port))
                 port_available = True
-            except:
+            except Exception as e:
                 port_available = False
-                logger.warning('Port %s is in use' % port)
+                logger.warning(f'Port {port} is in use: {e}')
                 port += 1
             finally:
                 sock.close()
@@ -732,72 +913,118 @@ class BrowserView(QMainWindow):
 
 
 def setup_app():
-    # MUST be called before create_window and set_app_menu
     global _app
-    _app = QApplication.instance() or QApplication([])
+    if settings['IGNORE_SSL_ERRORS']:
+        environ_append('QTWEBENGINE_CHROMIUM_FLAGS', '--ignore-certificate-errors')
+    if settings['REMOTE_DEBUGGING_PORT']:
+        environ_append(
+            'QTWEBENGINE_CHROMIUM_FLAGS',
+            f'--remote-debugging-port={settings["REMOTE_DEBUGGING_PORT"]}',
+        )
+    _app = QApplication.instance() or QApplication(sys.argv)
+
 
 def create_window(window):
     def _create():
         browser = BrowserView(window)
         browser.installEventFilter(browser)
 
-        # If the menu we created as part of set_app_menu was not set as the native menu, then
-        #     we need to recreate the menu for every window
-        if BrowserView.global_menubar and not BrowserView.global_menubar.isNativeMenuBar():
+        if window.menu or _app_menu:
+            menu = window.menu or _state['menu']
             window_menubar = browser.menuBar()
-            for menu in BrowserView.global_menubar_top_menus:
-                window_menubar.addMenu(menu)
+            create_menu(menu, window_menubar)
 
         _main_window_created.set()
 
-        if window.minimized:
+        if window.maximized:
+            browser.showMaximized()
+        elif window.minimized:
             # showMinimized does not work on start without showNormal first
             # looks like a bug in QT
             browser.showNormal()
             browser.showMinimized()
         elif not window.hidden:
             browser.show()
+        elif window.hidden:
+            browser.pywebview_window.events.shown.set()
 
     if window.uid == 'master':
-        global _app
+        global _app, _app_menu
+        if _state['menu']:
+            _app_menu = QMenuBar()
+            _app_menu.setNativeMenuBar(False)
+            create_menu(_state['menu'], _app_menu)
+        else:
+            _app_menu = None
+
         _app = QApplication.instance() or QApplication(sys.argv)
+
+        signal.signal(signal.SIGINT, _sigint_handler)
+
+        # Create a timer to periodically allow the Python interpreter to run
+        # This enables the signal handler to be called even when the Qt event loop is running
+        # The timer just calls a no-op function to trigger Python execution
+        timer = QtCore.QTimer()
+        timer.start(500)
+        timer.timeout.connect(lambda: None)
 
         _create()
         _app.exec_()
     else:
         _main_window_created.wait()
-        i = list(BrowserView.instances.values())[0] # arbitrary instance
+        i = list(BrowserView.instances.values())[0]  # arbitrary instance
         i.create_window_trigger.emit(_create)
 
 
 def set_title(title, uid):
-    BrowserView.instances[uid].set_title(title)
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.set_title(title)
+
+
+def clear_cookies(uid):
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.clear_cookies()
 
 
 def get_cookies(uid):
-    return BrowserView.instances[uid].get_cookies()
+    i = BrowserView.instances.get(uid)
+    if i:
+        return i.get_cookies()
 
 
 def get_current_url(uid):
-    return BrowserView.instances[uid].get_current_url()
+    i = BrowserView.instances.get(uid)
+    if i:
+        return i.get_current_url()
 
 
 def load_url(url, uid):
-    BrowserView.instances[uid].load_url(url)
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.load_url(url)
 
 
 def load_html(content, base_uri, uid):
-    BrowserView.instances[uid].load_html(content, base_uri)
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.load_html(content, base_uri)
 
 
-def set_app_menu(app_menu_list):
+def create_menu(app_menu_list, menubar):
     """
-    Create a custom menu for the app bar menu (on supported platforms).
-    Otherwise, this menu is used across individual windows.
+    Create the menu bar for the application for the provided QMenuBar object. Menu can be either a global
+    application menu or a window-specific menu.
 
     Args:
         app_menu_list ([webview.menu.Menu])
+        menubar (QMenuBar)
     """
+
+    def run_action(func):
+        Thread(target=func).start()
+
     def create_submenu(title, line_items, supermenu):
         m = supermenu.addMenu(title)
         BrowserView.global_menubar_other_objects.append(m)
@@ -807,7 +1034,7 @@ def set_app_menu(app_menu_list):
             elif isinstance(menu_line_item, MenuAction):
                 new_action = QAction(menu_line_item.title)
                 func = copy(menu_line_item.function)
-                new_action.triggered.connect(lambda: Thread(target=func).start())
+                new_action.triggered.connect(partial(run_action, func))
                 m.addAction(new_action)
                 BrowserView.global_menubar_other_objects.append(new_action)
             elif isinstance(menu_line_item, Menu):
@@ -815,27 +1042,20 @@ def set_app_menu(app_menu_list):
 
         return m
 
-
-    # If the application menu has already been created, we don't want to do it again
-    if len(BrowserView.global_menubar_top_menus) > 0 or len(BrowserView.global_menubar_other_objects) > 0:
-        return
-
-    top_level_menu = QMenuBar()
-    top_level_menu.setNativeMenuBar(True)
-
-    BrowserView.global_menubar = top_level_menu
-
     for app_menu in app_menu_list:
-        BrowserView.global_menubar_top_menus.append(
-            create_submenu(app_menu.title, app_menu.items, top_level_menu)
-        )
+        # Ignore '__app__' menus (macOS-only feature)
+        if app_menu.title == '__app__':
+            continue
+        menu = create_submenu(app_menu.title, app_menu.items, menubar)
+        menubar.addMenu(menu)
 
 
 def get_active_window():
     active_window = None
     try:
         active_window = _app.activeWindow()
-    except:
+    except Exception as e:
+        logger.warning(f'Failed to get active window: {e}')
         return None
 
     if active_window:
@@ -845,43 +1065,69 @@ def get_active_window():
 
 
 def destroy_window(uid):
-    BrowserView.instances[uid].destroy_()
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.destroy_()
 
 
 def hide(uid):
-    BrowserView.instances[uid].hide_()
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.hide_()
 
 
 def show(uid):
-    BrowserView.instances[uid].show_()
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.show_()
+
+
+def maximize(uid):
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.maximize()
 
 
 def minimize(uid):
-    BrowserView.instances[uid].minimize()
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.minimize()
 
 
 def restore(uid):
-    BrowserView.instances[uid].restore()
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.restore()
 
 
 def toggle_fullscreen(uid):
-    BrowserView.instances[uid].toggle_fullscreen()
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.toggle_fullscreen()
 
 
 def set_on_top(uid, top):
-    BrowserView.instances[uid].set_on_top(top)
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.set_on_top(top)
 
 
 def resize(width, height, uid, fix_point):
-    BrowserView.instances[uid].resize_(width, height, fix_point)
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.resize_(width, height, fix_point)
 
 
 def move(x, y, uid):
-    BrowserView.instances[uid].move_window(x, y)
+    i = BrowserView.instances.get(uid)
+    if i:
+        i.move_window(x, y)
 
 
 def create_confirmation_dialog(title, message, uid):
-    return BrowserView.instances[uid].create_confirmation_dialog(title, message)
+    i = BrowserView.instances.get(uid)
+    if i:
+        return i.create_confirmation_dialog(title, message)
 
 
 def create_file_dialog(dialog_type, directory, allow_multiple, save_filename, file_types, uid):
@@ -889,32 +1135,53 @@ def create_file_dialog(dialog_type, directory, allow_multiple, save_filename, fi
     file_types = [s.replace(';', ' ') for s in file_types]
     file_filter = ';;'.join(file_types)
 
-    i = BrowserView.instances[uid]
-    return i.create_file_dialog(dialog_type, directory, allow_multiple, save_filename, file_filter)
+    i = BrowserView.instances.get(uid)
+    if i:
+        return i.create_file_dialog(
+            dialog_type, directory, allow_multiple, save_filename, file_filter
+        )
 
 
-def evaluate_js(script, uid):
-    return BrowserView.instances[uid].evaluate_js(script)
+def evaluate_js(script, uid, parse_json=True):
+    i = BrowserView.instances.get(uid)
+    if i:
+        return i.evaluate_js(script, parse_json)
 
 
 def get_position(uid):
-    position = BrowserView.instances[uid].pos()
-    return position.x(), position.y()
+    i = BrowserView.instances.get(uid)
+    if i:
+        position = i.geometry()
+        return position.x(), position.y()
+    else:
+        return None, None
 
 
 def get_size(uid):
-    window = BrowserView.instances[uid]
-    return window.width(), window.height()
+    i = BrowserView.instances.get(uid)
+    if i:
+        return i.width(), i.height()
+    else:
+        return None, None
 
 
 def get_screens():
     global _app
     _app = QApplication.instance() or QApplication(sys.argv)
-
-    geometries = [s.geometry() for s in _app.screens()]
-    screens = [Screen(g.width(), g.height()) for g in geometries]
+    screens = [
+        Screen(
+            s.geometry().x(),
+            s.geometry().y(),
+            s.geometry().width(),
+            s.geometry().height(),
+            s,
+            s.devicePixelRatio(),
+        )
+        for s in _app.screens()
+    ]
 
     return screens
+
 
 def add_tls_cert(certfile):
     config = QSslConfiguration.defaultConfiguration()
@@ -923,4 +1190,3 @@ def add_tls_cert(certfile):
     certs.append(cert)
     config.setCaCertificates(certs)
     QSslConfiguration.setDefaultConfiguration(config)
-    

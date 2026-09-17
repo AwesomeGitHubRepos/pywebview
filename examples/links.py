@@ -1,10 +1,8 @@
+"""
+Demonstrate a difference between different link types
+"""
+
 import webview
-import threading
-
-"""
-This example demonstrates a difference between different link types
-"""
-
 
 html = """
   <html>

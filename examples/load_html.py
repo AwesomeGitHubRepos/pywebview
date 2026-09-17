@@ -1,9 +1,10 @@
-import webview
+"""
+Loading new HTML after the window is created
+"""
+
 from time import sleep
 
-"""
-This example demonstrates how to load HTML in a web view window
-"""
+import webview
 
 
 def load_html(window):

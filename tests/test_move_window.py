@@ -1,6 +1,8 @@
+from threading import Lock
+
 import webview
-from time import sleep
-from .util import run_test
+
+from .util import run_test, wait_release
 
 
 def test_xy():
@@ -14,15 +16,30 @@ def test_move_window():
 
 
 def xy(window):
-    assert window.x == 200
-    assert window.y == 200
+    # Coordinates are not always exact due to window manager decorations
+    window.events.shown.wait()
+    assert abs(window.x - 200) < 10
+    assert abs(window.y - 200) < 10
 
 
 def move_window(window):
-    window.move(100, 100)
-    sleep(1)
+    # Coordinates are not always exact due to window manager decorations
+    def moved():
+        try:
+            assert abs(window.x - 300) < 10
+            assert abs(window.y - 300) < 10
+        except AssertionError as e:
+            nonlocal exception
+            exception = e
 
-    assert window.x == 100
-    assert window.y == 100
+        wait_release(lock)
 
+    lock = Lock()
+    exception = False
+    lock.acquire()
+    window.events.moved += moved
+    window.move(300, 300)
 
+    assert lock.acquire(3)
+    if exception:
+        raise exception

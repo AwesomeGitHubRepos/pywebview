@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """
 (C) 2014-2019 Roman Sirokov and contributors
 Licensed under BSD license
@@ -7,6 +5,9 @@ Licensed under BSD license
 http://github.com/r0x0r/pywebview/
 """
 
+from __future__ import annotations
+
+import hmac
 import inspect
 import json
 import logging
@@ -14,18 +15,26 @@ import os
 import re
 import sys
 import traceback
+import urllib.parse
+from collections import UserDict
+from collections.abc import Callable
+from glob import glob
 from http.cookies import SimpleCookie
 from platform import architecture
 from threading import Thread
+from typing import TYPE_CHECKING, Any, TypeGuard
 from uuid import uuid4
 
 import webview
-from webview import http
-from .js import api, npo, dom, event, drag
+from webview.dom import _dnd_state
+from webview.errors import WebViewException
 
-_token = uuid4().hex
+if TYPE_CHECKING:
+    from webview.window import Window
 
-default_html = """
+_TOKEN = uuid4().hex
+
+DEFAULT_HTML = """
     <!doctype html>
     <html>
         <head>
@@ -38,42 +47,78 @@ default_html = """
 logger = logging.getLogger('pywebview')
 
 
-class WebViewException(Exception):
-    pass
+class ImmutableDict(UserDict):
+    """ "
+    A dictionary that does not allow adding new keys or deleting existing ones.
+    Only existing keys can be modified.
+    """
+
+    def __init__(self, initial_data: dict[Any, Any] | None = None, **kwargs: Any) -> None:
+        self.data = {}
+        if initial_data:
+            self.data.update(initial_data)
+        if kwargs:
+            self.data.update(kwargs)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key not in self.data:
+            raise KeyError(f"Cannot add new key '{key}'. Only existing keys can be modified.")
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key: Any) -> None:
+        raise KeyError('Deleting keys is not allowed.')
 
 
-def is_app(url):
-    """ Returns true if 'url' is a WSGI or ASGI app. """
+def is_app(url: str | Callable[..., Any] | None) -> TypeGuard[Callable[..., Any]]:
+    """Returns true if 'url' is a WSGI or ASGI app."""
     return callable(url)
 
-def is_local_url(url):
-    return not ((is_app(url)) or ((not url) or (url.startswith('http://')) or (url.startswith('https://'))))
 
-def needs_server(urls):
-    return not not [url for url in urls if (is_app(url) or is_local_url(url))]
+def is_local_url(url: str | Callable[..., Any] | None) -> TypeGuard[str]:
+    if is_app(url) or not url or not isinstance(url, str):
+        return False
+    return not (
+        url.startswith('http://') or url.startswith('https://') or url.startswith('file://')
+    )
 
 
-def get_app_root():
+def needs_server(urls: list[str]) -> bool:
+    return bool([url for url in urls if (is_app(url) or is_local_url(url))])
+
+
+def get_app_root() -> str:
     """
     Gets the file root of the application.
     """
 
-    if hasattr(sys, '_MEIPASS'): # Pyinstaller
+    if hasattr(sys, '_MEIPASS'):  # Pyinstaller
         return sys._MEIPASS
 
-    if getattr(sys, 'frozen', False): # cx_freeze
+    resource_path = os.getenv('RESOURCEPATH')  # py2app
+    if resource_path:
+        return resource_path
+
+    if getattr(sys, 'frozen', False):  # cx_freeze
         return os.path.dirname(sys.executable)
 
-    if 'pytest' in sys.modules:
-        for arg in reversed(sys.argv):
-            path = os.path.realpath(arg.split('::')[0])
-            if os.path.exists(path):
-                return path if os.path.isdir(path) else os.path.dirname(path)
+    # Before the pytest branch: the suite also runs on-device under pytest,
+    # where there is no sibling tests/ directory and the pytest branch would
+    # return a path that does not exist.
+    if hasattr(sys, 'getandroidapilevel'):
+        return os.getenv('ANDROID_APP_PATH') or ''
+
+    if 'pytest' in sys.modules and os.getenv('PYWEBVIEW_TEST'):
+        return os.path.join(os.path.dirname(__file__), '..', 'tests')
 
     return os.path.dirname(os.path.realpath(sys.argv[0]))
 
 
-def abspath(path):
+def is_test_mode():
+    """During the test suite (PYWEBVIEW_TEST) windows should not steal system focus."""
+    return bool(os.environ.get('PYWEBVIEW_TEST'))
+
+
+def abspath(path: str) -> str:
     """
     Make path absolute, using the application root
     """
@@ -83,155 +128,404 @@ def abspath(path):
     return os.path.normpath(path)
 
 
-def base_uri(relative_path=''):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
+def base_uri(relative_path: str = '') -> str:
+    """Get absolute path to resource, works for dev and for PyInstaller"""
     base_path = get_app_root()
     if not os.path.exists(base_path):
-        raise ValueError('Path %s does not exist' % base_path)
+        raise ValueError(f'Path {base_path} does not exist')
 
-    return 'file://%s' % os.path.join(base_path, relative_path)
+    return f'file://{os.path.join(base_path, relative_path)}'
 
 
-def create_cookie(input):
-    if type(input) == dict:
+def create_cookie(input_: dict[Any, Any] | str) -> SimpleCookie:
+    if isinstance(input_, dict):
         cookie = SimpleCookie()
-        name = input['name']
-        cookie[name] = input['value']
-        cookie[name]['path'] = input['path']
-        cookie[name]['domain'] = input['domain']
-        cookie[name]['expires'] = input['expires']
-        cookie[name]['secure'] = input['secure']
-        cookie[name]['httponly'] = input['httponly']
-
-        if sys.version_info.major >= 3 and sys.version_info.minor >= 8:
-            cookie[name]['samesite'] = input.get('samesite')
+        name = input_['name']
+        cookie[name] = input_['value']
+        cookie[name]['path'] = input_['path']
+        cookie[name]['domain'] = input_['domain']
+        # A Morsel treats only '' as "omit this attribute" - passing None
+        # through (as backends do for a session cookie with no expiry, e.g.
+        # winui3.py's _format_cookie_expiry) makes SimpleCookie.output()
+        # render the literal string "expires=None" instead of leaving the
+        # attribute out. Check `is None` specifically, not truthiness: 0 is
+        # a legitimate expiry (the Unix epoch, used to expire a cookie
+        # immediately) and must not be normalized away like None is.
+        cookie[name]['expires'] = '' if input_['expires'] is None else input_['expires']
+        cookie[name]['secure'] = input_['secure']
+        cookie[name]['httponly'] = input_['httponly']
+        # Same None-vs-'' issue as expires above: several backends (e.g.
+        # winui3.py, edgechromium.py) can't distinguish "SameSite absent"
+        # from "SameSite=None" in the underlying platform API and report
+        # both as None here - passing that through renders the literal
+        # string "SameSite=None" in the output. Omit the attribute instead
+        # of asserting a policy this backend can't actually confirm.
+        same_site = input_.get('samesite')
+        cookie[name]['samesite'] = '' if same_site is None else same_site
 
         return cookie
-    elif type(input) == str:
-        return SimpleCookie(input)
+
+    if isinstance(input_, str):
+        return SimpleCookie(input_)
 
     raise WebViewException('Unknown input to create_cookie')
 
 
-
-
-def parse_file_type(file_type):
-    '''
+def parse_file_type(file_type: str) -> tuple[str, str]:
+    """
     :param file_type: file type string 'description (*.file_extension1;*.file_extension2)' as required by file filter in create_file_dialog
     :return: (description, file extensions) tuple
-    '''
-    valid_file_filter = r'^([\w ]+)\((\*(?:\.(?:\w+|\*))*(?:;\*\.\w+)*)\)$'
+    """
+    valid_file_filter = r'^([\w ]+)\((\*(?:\.(?:\w+|\*))*(?:;\*(?:\.(?:\w+|\*))*)*)\)$'
     match = re.search(valid_file_filter, file_type)
 
     if match:
         return match.group(1).rstrip(), match.group(2)
-    else:
-        raise ValueError('{0} is not a valid file filter'.format(file_type))
+    raise ValueError(f'{file_type} is not a valid file filter')
 
 
-def parse_api_js(window, platform, uid=''):
-    def get_args(f):
-        params = list(inspect.getfullargspec(f).args)
+def inject_pywebview(platform: str, window: Window) -> None:
+    """ "
+    Generates and injects a global window.pywebview object. The object contains exposed API functions
+    as well as utility functions required by pywebview. The function fires before_load event before
+    injecting the object and loaded event after the object is injected.
+    """
+    exposed_objects = []
+
+    def get_args(func: object):
+        params = list(inspect.getfullargspec(func).args)
         return params
 
-    def generate_func():
-        if window._js_api:
-            functions = { name: get_args(getattr(window._js_api, name))[1:] for name in dir(window._js_api) if inspect.ismethod(getattr(window._js_api, name)) and not name.startswith('_')}
-        else:
+    def get_functions(
+        obj: object, base_name: str = '', functions: dict[str, object] | None = None, depth: int = 0
+    ):
+        if functions is None:
             functions = {}
 
+        # Backstop against runaway recursion into pathological object graphs that generate
+        # a fresh object on every attribute access (so the id() guard below never matches).
+        # See issue #1838.
+        if depth > webview.settings['JS_API_MAX_DEPTH']:
+            logger.warning(
+                f'Maximum js_api attribute depth ({webview.settings["JS_API_MAX_DEPTH"]}) reached '
+                f'while exposing "{base_name}". Nested attributes below this depth are not exposed. '
+                'Increase webview.settings["JS_API_MAX_DEPTH"] if this is intended.'
+            )
+            return functions
+
+        obj_id = id(obj)
+        if obj_id in exposed_objects:
+            return functions
+        else:
+            exposed_objects.append(obj_id)
+
+        for name in dir(obj):
+            try:
+                full_name = f'{base_name}.{name}' if base_name else name
+                if name.startswith('_'):
+                    continue
+
+                # Never walk into the native GUI object exposed by webview.Window (e.g.
+                # when a window is stored on the js_api object). It cannot be bridged to
+                # Javascript and its native object tree is effectively unbounded.
+                if name == 'native' and isinstance(obj, webview.Window):
+                    continue
+
+                attr = getattr(obj, name)
+                if not getattr(attr, '_serializable', True):
+                    continue
+
+                if inspect.ismethod(attr) or inspect.isfunction(attr):
+                    functions[full_name] = get_args(attr)[1:]
+                # If the attribute is a class or a non-callable object, make a recursive call
+                elif inspect.isclass(attr) or (
+                    isinstance(attr, object) and not callable(attr) and hasattr(attr, '__module__')
+                ):
+                    get_functions(attr, full_name, functions, depth + 1)
+            except Exception as e:
+                logger.error(f'Error while processing {full_name}: {e}')
+                continue
+
+        return functions
+
+    def generate_func():
+        functions = get_functions(window._js_api)
+
         if len(window._functions) > 0:
-            expose_functions = { name: get_args(f) for name, f in window._functions.items()}
+            expose_functions = {name: get_args(f) for name, f in window._functions.items()}
         else:
             expose_functions = {}
 
         functions.update(expose_functions)
-        functions = functions.items()
 
-        return [ {'func': name, 'params': params} for name, params in functions ]
+        return [{'func': name, 'params': params} for name, params in functions.items()]
 
-    try:
-        func_list = generate_func()
-    except Exception as e:
-        logger.exception(e)
-        func_list = []
+    def generate_js_object():
+        window.run_js(js_code)
+        logger.debug('_pywebviewready event fired')
 
-    js_code = npo.src + event.src + \
-        api.src % {
-            'token': _token,
-            'platform': platform,
-            'uid': uid,
-            'func_list': func_list,
-            'js_api_endpoint': window.js_api_endpoint
-        } + \
-        dom.src + drag.src % {
-            'drag_selector': webview.DRAG_REGION_SELECTOR,
-            'zoomable': str(window.zoomable).lower(),
-            'draggable': str(window.draggable).lower()
-        }
-    return js_code
+        try:
+            with window._expose_lock:
+                func_list = generate_func()
+                window.run_js(finish_script % {'functions': json.dumps(func_list)})
+                window.events._pywebviewready.set()
+                window.events.loaded.set()
+                logger.debug('loaded event fired')
+        except Exception as e:
+            logger.exception(e)
+            window.events.loaded.set()
+
+    window.events.before_load.set()
+    logger.debug('before_load event fired. injecting pywebview object')
+    js_code, finish_script = load_js_files(window, platform)
+    thread = Thread(target=generate_js_object)
+    thread.start()
 
 
-def js_bridge_call(window, func_name, param, value_id):
+def is_js_bridge_token_valid(window: Window, token: str | None) -> bool:
+    """Return whether a native bridge message carries the session token."""
+    # MSHTML does not support passing a token through its JS bridge, so it is
+    # excluded from token validation.
+    if window.gui.renderer != 'mshtml' and not hmac.compare_digest(str(token), _TOKEN):
+        logger.error('Rejected JS bridge call with an invalid token')
+        return False
+
+    return True
+
+
+def js_bridge_call(
+    window: Window, func_name: str, param: Any, value_id: str, token: str | None = None
+) -> None:
+    """
+    Calls a function from the JS API and executes it in Python. The function is executed in a separate
+    thread to prevent blocking the UI thread. The result is then passed back to the JS API.
+    """
+
+    if not is_js_bridge_token_valid(window, token):
+        return
+
     def _call():
         try:
-            result = func(*func_params.values())
-            result = json.dumps(result).replace('\\', '\\\\').replace('\'', '\\\'')
-            code = 'window.pywebview._returnValues["{0}"]["{1}"] = {{value: \'{2}\'}}'.format(func_name, value_id, result)
+            result = func(*func_params)
+            result = json.dumps(result).replace('\\', '\\\\').replace("'", "\\'")
+            retval = f"{{value: '{result}'}}"
         except Exception as e:
-            error = {
-                'message': str(e),
-                'name': type(e).__name__,
-                'stack': traceback.format_exc()
-            }
-            result = json.dumps(error).replace('\\', '\\\\').replace('\'', '\\\'')
-            code = 'window.pywebview._returnValues["{0}"]["{1}"] = {{isError: true, value: \'{2}\'}}'.format(func_name, value_id, result)
+            logger.error(traceback.format_exc())
+            error = {'message': str(e), 'name': type(e).__name__, 'stack': traceback.format_exc()}
+            result = json.dumps(error).replace('\\', '\\\\').replace("'", "\\'")
+            retval = f"{{isError: true, value: '{result}'}}"
 
-        window.evaluate_js(code)
+        window.evaluate_js(
+            f'window.pywebview._returnValuesCallbacks["{func_name}"]["{value_id}"]({retval})'
+        )
 
-    if func_name == 'moveWindow':
+    def get_nested_attribute(obj: object, attr_str: str):
+        attributes = attr_str.split('.')
+        for attr in attributes:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                return None
+        return obj
+
+    if func_name == 'pywebviewMoveWindow':
         window.move(*param)
         return
 
-    if func_name == 'asyncCallback':
+    if func_name == 'pywebviewEventHandler':
+        event = param['event']
+        node_id = param['nodeId']
+        element = window.dom._elements.get(node_id)
+
+        if not element:
+            return
+
+        if event['type'] == 'drop':
+            files = event['dataTransfer'].get('files', [])
+            for file in files:
+                path = [
+                    item
+                    for item in _dnd_state['paths']
+                    if urllib.parse.unquote(item[0]) == file['name']
+                ]
+                if len(path) == 0:
+                    continue
+
+                file['pywebviewFullPath'] = urllib.parse.unquote(path[0][1])
+                _dnd_state['paths'].remove(path[0])
+
+        for handler in element._event_handlers.get(event['type'], []):
+            thread = Thread(target=handler, args=(event,))
+            thread.start()
+
+        return
+
+    if func_name == 'pywebviewAsyncCallback':
         value = json.loads(param) if param is not None else None
 
-        if callable(window._callbacks[value_id]):
-            window._callbacks[value_id](value)
+        if value_id not in window._callbacks:
+            logger.warning(f'No callback registered for value_id {value_id}. Ignoring.')
+            return
+
+        callback = window._callbacks[value_id]
+        if callable(callback):
+            callback(value)
         else:
-            logger.error('Async function executed and callback is not callable. Returned value {0}'.format(value))
+            logger.error(
+                f'Async function executed and callback is not callable. Returned value {value}'
+            )
 
         del window._callbacks[value_id]
         return
 
-    func = window._functions.get(func_name) or getattr(window._js_api, func_name, None)
+    if func_name == 'pywebviewStateUpdate':
+        try:
+            window.state.__setattr__(param['key'], param['value'], False)
+        except Exception:
+            logger.exception('Error occurred while updating state key %s', param.get('key'))
+        return
+
+    if func_name == 'pywebviewStateDelete':
+        special_key = '__pywebviewHaltUpdate__' + param
+        try:
+            delattr(window.state, special_key)
+        except AttributeError:
+            # The key was already removed on the Python side (e.g. a race with a
+            # concurrent delete or update); nothing left to do on the JS side.
+            pass
+        except Exception:
+            logger.exception('Error occurred while deleting state key %s', param)
+        return
+
+    func = window._functions.get(func_name) or get_nested_attribute(window._js_api, func_name)
 
     if func is not None:
         try:
             func_params = param
-            t = Thread(target=_call)
-            t.start()
+            thread = Thread(target=_call)
+            thread.start()
         except Exception:
-            logger.exception('Error occurred while evaluating function {0}'.format(func_name))
+            logger.exception('Error occurred while evaluating function %s', func_name)
     else:
-        logger.error('Function {}() does not exist'.format(func_name))
+        logger.error('Function %s() does not exist', func_name)
 
 
-def escape_string(string):
-    return string\
-        .replace('\\', '\\\\') \
-        .replace('"', r'\"') \
-        .replace('\n', r'\n')\
+def load_js_files(window: Window, platform: str) -> tuple[str, str]:
+    """
+    Load JS files in the order they should be loaded.
+    The order is polyfill, api, the rest and finish.js.
+    Return the concatenated JS code and the finish script, which must be loaded last and
+    separately in order to
+    """
+    js_dir = get_js_dir()
+    logger.debug('Loading JS files from %s', js_dir)
+    js_files = glob(os.path.join(js_dir, '**', '*.js'), recursive=True)
+    ordered_js_files = sort_js_files(js_files)
+    js_code = ''
+    finish_script = ''
+
+    for file in ordered_js_files:
+        with open(file) as f:
+            name = os.path.splitext(os.path.basename(file))[0]
+            content = f.read()
+            params = {}
+
+            if name == 'api':
+                params = {
+                    'token': _TOKEN,
+                    'platform': platform,
+                    'uid': window.uid,
+                    'js_api_endpoint': window.js_api_endpoint,
+                }
+            elif name == 'customize':
+                params = {
+                    'text_select': str(window.text_select),
+                    'drag_selector': webview.settings['DRAG_REGION_SELECTOR'],
+                    'drag_region_direct_target_only': str(
+                        webview.settings['DRAG_REGION_DIRECT_TARGET_ONLY']
+                    ),
+                    'zoomable': str(window.zoomable),
+                    'draggable': str(window.draggable),
+                    'easy_drag': str(
+                        platform in ('edgechromium', 'winui3')
+                        and window.easy_drag
+                        and window.frameless
+                    ),
+                }
+            elif name == 'state':
+                params = {'state': escape_string(json.dumps(window.state))}
+            elif name == 'finish':
+                finish_script = content
+                continue
+            elif name == 'polyfill' and platform != 'mshtml':
+                continue
+
+            js_code += content % params
+
+    return js_code, finish_script
+
+
+def get_js_dir() -> str:
+    """
+    Get the path to the directory with Javascript files.
+    """
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'js')
+
+    if os.path.exists(path):
+        return path
+
+    # try py2app frozen path. This is hacky, but it works.
+    # See https://github.com/r0x0r/pywebview/issues/1565
+    if '.zip' in path:
+        base_path = path.split('.zip')[0]
+        dir = os.path.dirname(base_path)
+
+        for file in os.listdir(dir):
+            if file.startswith('python') and os.path.isdir(os.path.join(dir, file)):
+                js_path = os.path.join(dir, file, 'webview', 'js')
+                if os.path.exists(js_path):
+                    return js_path
+
+    raise FileNotFoundError(f'Cannot find JS directory in {path}')
+
+
+def sort_js_files(js_files: list[str]) -> list[str]:
+    """
+    Sorts JS files in the order they should be loaded. Polyfill first, then API, then the rest and
+    finally finish.js that fires a pywebviewready event.
+    """
+    LOAD_ORDER = {'polyfill': 0, 'api': 1, 'state': 2}
+
+    ordered_js_files = []
+    remaining_js_files = []
+
+    for file in js_files:
+        basename = os.path.splitext(os.path.basename(file))[0]
+        if basename not in LOAD_ORDER:
+            ordered_js_files.append(file)
+        else:
+            remaining_js_files.append((basename, file))
+
+    for basename, file in sorted(remaining_js_files, key=lambda x: LOAD_ORDER[x[0]]):
+        ordered_js_files.insert(LOAD_ORDER[basename], file)
+
+    return ordered_js_files
+
+
+def escape_string(string: str) -> str:
+    return (
+        string.replace('\\', '\\\\')
+        .replace('"', r'\"')
+        .replace('\n', r'\n')
         .replace('\r', r'\r')
+        .replace("'", r'\'')
+        .replace('\u2028', r'\u2028')
+        .replace('\u2029', r'\u2029')
+    )
 
 
-def escape_line_breaks(string):
-    return string.replace('\\n', '\\\\n').replace('\\r', '\\\\r')
-
-
-def inject_base_uri(content, base_uri):
+def inject_base_uri(content: str, base_uri: str) -> str:
     pattern = r'<%s(?:[\s]+[^>]*|)>'
-    base_tag = '<base href="%s">' % base_uri
+    base_tag = f'<base href="{base_uri}">'
 
     match = re.search(pattern % 'base', content)
 
@@ -256,12 +550,22 @@ def inject_base_uri(content, base_uri):
     return base_tag + content
 
 
-def interop_dll_path(dll_name):
+def interop_dll_path(dll_name: str) -> str:
     if dll_name == 'WebBrowserInterop.dll':
-        dll_name = 'WebBrowserInterop.x64.dll' if architecture()[0] == '64bit' else 'WebBrowserInterop.x86.dll'
+        dll_name = (
+            'WebBrowserInterop.x64.dll'
+            if architecture()[0] == '64bit'
+            else 'WebBrowserInterop.x86.dll'
+        )
 
     # Unfrozen path
     dll_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', dll_name)
+    if os.path.exists(dll_path):
+        return dll_path
+
+    dll_path = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), 'lib', 'runtimes', dll_name, 'native'
+    )
     if os.path.exists(dll_path):
         return dll_path
 
@@ -272,10 +576,10 @@ def interop_dll_path(dll_name):
 
     try:
         # Frozen path packed as onefile
-        if hasattr(sys, '_MEIPASS'): # Pyinstaller
+        if hasattr(sys, '_MEIPASS'):  # Pyinstaller
             dll_path = os.path.join(sys._MEIPASS, dll_name)
 
-        elif getattr(sys, 'frozen', False): # cx_freeze
+        elif getattr(sys, 'frozen', False):  # cx_freeze
             dll_path = os.path.join(sys.executable, dll_name)
 
         if os.path.exists(dll_path):
@@ -283,5 +587,29 @@ def interop_dll_path(dll_name):
     except Exception:
         pass
 
-    raise Exception('Cannot find %s' % dll_name)
+    raise FileNotFoundError(f'Cannot find {dll_name}')
 
+
+def environ_append(key: str, *values: str, sep: str = ' ') -> None:
+    """Append values to an environment variable, separated by sep"""
+    value_list = list(values)
+
+    existing = os.environ.get(key, '')
+    if existing:
+        value_list = [existing] + value_list
+
+    os.environ[key] = sep.join(value_list)
+
+
+def css_to_camel(css_case_string: str) -> str:
+    words = css_case_string.split('-')
+    camel_case_string = words[0] + ''.join(word.capitalize() for word in words[1:])
+    return camel_case_string
+
+
+def android_jar_path() -> str:
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'pywebview-android.jar')
+
+
+def stringify_headers(headers: dict[str, Any]) -> dict[str, str]:
+    return {k: str(v) for k, v in headers.items()}

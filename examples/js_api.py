@@ -1,14 +1,13 @@
+"""
+Create an application without a HTTP server. The application uses Javascript API object to communicate between Python and Javascript.
+"""
+
+import random
+import sys
 import threading
 import time
-import sys
-import random
+
 import webview
-
-
-"""
-This example demonstrates how to create a pywebview api without using a web
-server
-"""
 
 html = """
 <!DOCTYPE html>
@@ -19,10 +18,11 @@ html = """
 <style>
     #response-container {
         display: none;
-        padding: 3rem;
-        margin: 3rem 5rem;
+        padding: 1rem;
+        margin: 3rem 5%;
         font-size: 120%;
         border: 5px dashed #ccc;
+        word-wrap: break-word;
     }
 
     label {
@@ -74,7 +74,7 @@ html = """
     function doHeavyStuff() {
         var btn = document.getElementById('heavy-stuff-btn')
 
-        pywebview.api.doHeavyStuff().then(function(response) {
+        pywebview.api.heavy_stuff.doHeavyStuff().then(function(response) {
             showResponse(response)
             btn.onclick = doHeavyStuff
             btn.innerText = 'Perform a heavy operation'
@@ -86,7 +86,7 @@ html = """
     }
 
     function cancelHeavyStuff() {
-        pywebview.api.cancelHeavyStuff()
+        pywebview.api.heavy_stuff.cancelHeavyStuff()
     }
 
     function getRandomNumber() {
@@ -108,21 +108,9 @@ html = """
 """
 
 
-class Api:
+class HeavyStuffAPI:
     def __init__(self):
         self.cancel_heavy_stuff_flag = False
-
-    def init(self):
-        response = {
-            'message': 'Hello from Python {0}'.format(sys.version)
-        }
-        return response
-
-    def getRandomNumber(self):
-        response = {
-            'message': 'Here is a random number courtesy of randint: {0}'.format(random.randint(0, 100000000))
-        }
-        return response
 
     def doHeavyStuff(self):
         time.sleep(0.1)  # sleep to prevent from the ui thread from freezing for a moment
@@ -136,7 +124,7 @@ class Api:
         else:
             then = time.time()
             response = {
-                'message': 'Operation took {0:.1f} seconds on the thread {1}'.format((then - now), threading.current_thread())
+                'message': f'Operation took {then - now:.1f} seconds on the thread {threading.current_thread()}'
             }
         return response
 
@@ -144,18 +132,38 @@ class Api:
         time.sleep(0.1)
         self.cancel_heavy_stuff_flag = True
 
-    def sayHelloTo(self, name):
+
+class NotExposedApi:
+    _serializable = False
+
+    def notExposedMethod(self):
+        return 'This method is not exposed'
+
+
+class Api:
+    heavy_stuff = HeavyStuffAPI()
+    _this_wont_be_exposed = HeavyStuffAPI()
+    this_wont_be_exposed = NotExposedApi()
+
+    def init(self):
+        response = {'message': f'Hello from Python {sys.version}'}
+        return response
+
+    def getRandomNumber(self):
         response = {
-            'message': 'Hello {0}!'.format(name)
+            'message': f'Here is a random number courtesy of randint: {random.randint(0, 100000000)}'
         }
+        return response
+
+    def sayHelloTo(self, name):
+        response = {'message': f'Hello {name}!'}
         return response
 
     def error(self):
         raise Exception('This is a Python exception')
 
 
-
 if __name__ == '__main__':
     api = Api()
-    window = webview.create_window('API example', html=html, js_api=api)
+    window = webview.create_window('JS API example', html=html, js_api=api)
     webview.start()

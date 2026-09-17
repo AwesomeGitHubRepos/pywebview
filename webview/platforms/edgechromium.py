@@ -1,118 +1,158 @@
-# -*- coding: utf-8 -*-
-
-"""
-(C) 2014-2022 Roman Sirokov and contributors
-Licensed under BSD license
-
-http://github.com/r0x0r/pywebview/
-"""
-
-import os
-import logging
 import json
-import webbrowser
+import logging
+import os
 from threading import Semaphore
+from uuid import uuid1
 
-from webview import _debug, _user_agent, _private_mode
-from webview.util import create_cookie, parse_api_js, interop_dll_path, default_html, js_bridge_call
-from webview.js.css import disable_text_select
+try:
+    import clr
+except Exception:
+    os.environ['PYTHONNET_RUNTIME'] = 'coreclr'
+    import clr
 
-import clr
-
+from webview import Window, _state
+from webview import settings as webview_settings
+from webview.platforms.webview2core import WebView2Core
+from webview.util import (
+    create_cookie,
+    get_app_root,
+    inject_pywebview,
+    interop_dll_path,
+)
 
 clr.AddReference('System.Windows.Forms')
 clr.AddReference('System.Collections')
 clr.AddReference('System.Threading')
 
-import System.Windows.Forms as WinForms
-from System import String, Action, Func, Type, Uri
-from System.Collections.Generic import List
-from System.Globalization import CultureInfo
-from System.Threading.Tasks import Task, TaskScheduler
-from System.Drawing import Color
+import System.Windows.Forms as WinForms  # noqa: E402
+from System import Action, Func, Object, String, Type, Uri  # noqa: E402
+from System.Collections.Generic import List  # noqa: E402
+from System.Drawing import Color  # noqa: E402
+from System.Globalization import CultureInfo  # noqa: E402
+from System.Threading.Tasks import Task, TaskScheduler  # noqa: E402
 
 clr.AddReference(interop_dll_path('Microsoft.Web.WebView2.Core.dll'))
 clr.AddReference(interop_dll_path('Microsoft.Web.WebView2.WinForms.dll'))
 
-from Microsoft.Web.WebView2.Core import CoreWebView2Cookie, CoreWebView2Environment
-from Microsoft.Web.WebView2.WinForms import WebView2, CoreWebView2CreationProperties
+from Microsoft.Web.WebView2.Core import (  # noqa: E402
+    CoreWebView2Cookie,
+    CoreWebView2ServerCertificateErrorAction,
+    CoreWebView2WebResourceContext,
+)
+from Microsoft.Web.WebView2.WinForms import CoreWebView2CreationProperties, WebView2  # noqa: E402
 
-for platform in ('arm64', 'x64', 'x86'):
+for platform in ('win-arm64', 'win-x64', 'win-x86'):
     os.environ['Path'] += ';' + interop_dll_path(platform)
 
 
 logger = logging.getLogger('pywebview')
+renderer = 'edgechromium'
 
-class EdgeChrome:
-    def __init__(self, form, window, cache_dir):
-        self.pywebview_window = window
-        self.web_view = WebView2()
+
+class WinFormsEdgeChrome(WebView2Core):
+    def __init__(self, form: WinForms.Form, window: Window, cache_dir: str):
+        super().__init__(window)
+
+        self.webview = WebView2()
         props = CoreWebView2CreationProperties()
+
+        runtime_path = webview_settings['WEBVIEW2_RUNTIME_PATH']
+        if runtime_path:
+            if not os.path.isabs(runtime_path):
+                runtime_path = os.path.join(get_app_root(), runtime_path)
+            if os.path.exists(runtime_path):
+                props.BrowserExecutableFolder = runtime_path
+                logger.debug(f'Using custom WebView2 runtime: {runtime_path}')
+            else:
+                logger.warning(
+                    f'Custom WebView2 runtime path does not exist: {runtime_path}. Using system WebView2.'
+                )
+
         props.UserDataFolder = cache_dir
-        self.web_view.CreationProperties = props
-        form.Controls.Add(self.web_view)
+        self.user_data_folder = props.UserDataFolder
+        props.set_IsInPrivateModeEnabled(_state['private_mode'])
+        props.AdditionalBrowserArguments = self._build_browser_args()
+
+        self.webview.CreationProperties = props
+
+        self.form = form
+        self._drag_hwnd = form.Handle.ToInt32()
+        form.Controls.Add(self.webview)
 
         self.js_results = {}
-        self.js_result_semaphore = Semaphore(0)
-        self.web_view.Dock = WinForms.DockStyle.Fill
-        self.web_view.BringToFront()
-        self.web_view.CoreWebView2InitializationCompleted += self.on_webview_ready
-        self.web_view.NavigationStarting += self.on_navigation_start
-        self.web_view.NavigationCompleted += self.on_navigation_completed
-        self.web_view.WebMessageReceived += self.on_script_notify
+        self.webview.Dock = WinForms.DockStyle.Fill
+        self.webview.BringToFront()
+        self.webview.CoreWebView2InitializationCompleted += self.on_webview_ready
+        self.webview.NavigationStarting += self.on_navigation_start
+        self.webview.NavigationCompleted += self.on_navigation_completed
+        self.webview.WebMessageReceived += self.on_script_notify
         self.syncContextTaskScheduler = TaskScheduler.FromCurrentSynchronizationContext()
 
+        r, g, b = self._parse_hex_color(window.background_color)
+        self.webview.DefaultBackgroundColor = Color.FromArgb(255, r, g, b)
+
         if window.transparent:
-            self.web_view.DefaultBackgroundColor = Color.Transparent
+            self.webview.DefaultBackgroundColor = Color.Transparent
 
-        self.url = None
-        self.ishtml = False
-        self.html = None
+        self.webview.EnsureCoreWebView2Async(None)
 
-        if window.real_url:
-            self.load_url(window.real_url)
-        elif window.html:
-            self.html = window.html
-            self.load_html(window.html, '')
-        else:
-            self.html = default_html
-            self.load_html(default_html, '')
-
-
-    def evaluate_js(self, script, semaphore, js_result, callback=None):
-        def _callback(result):
-            if callback is None:
-                result = None if result is None or result == '' else json.loads(result)
-                js_result.append(result)
-                semaphore.release()
+    def evaluate_js(self, script: str, parse_json: bool):
+        def _callback(res):
+            nonlocal result
+            if parse_json and res is not None:
+                try:
+                    result = json.loads(res)
+                except Exception:
+                    result = res
             else:
-                # future js callback option to handle async js method
-                callback(result)
-                js_result.append(None)
-                semaphore.release()
+                result = res
+            semaphore.release()
+
+        result = None
+        semaphore = Semaphore(0)
+        unique_id = uuid1().hex
+        self.js_results[unique_id] = {'semaphore': semaphore}
 
         try:
-            self.web_view.ExecuteScriptAsync(script).ContinueWith(
-                Action[Task[String]](lambda task: _callback(json.loads(task.Result))
-            ),
-            self.syncContextTaskScheduler)
-        except Exception as e:
+            self.webview.Invoke(
+                Func[Object](
+                    lambda: self.webview.ExecuteScriptAsync(script).ContinueWith(
+                        Action[Task[String]](lambda task: _callback(json.loads(task.Result))),
+                        self.syncContextTaskScheduler,
+                    )
+                )
+            )
+            semaphore.acquire()
+        except Exception:
             logger.exception('Error occurred in script')
-            js_result.append(None)
             semaphore.release()
+        finally:
+            del self.js_results[unique_id]
+
+        return result
+
+    def clear_cookies(self):
+        self.webview.CoreWebView2.CookieManager.DeleteAllCookies()
 
     def get_cookies(self, cookies, semaphore):
         def _callback(task):
             for c in task.Result:
                 _cookies.append(c)
-
-            self.web_view.Invoke(Func[Type](_parse_cookies))
+            self.webview.Invoke(Func[Type](_parse_cookies))
 
         def _parse_cookies():
             # cookies must be accessed in the main thread, otherwise an exception is thrown
             # https://github.com/MicrosoftEdge/WebView2Feedback/issues/1976
             for c in _cookies:
-                same_site = None if c.SameSite == 0 else str(c.SameSite).lower()
+                # SameSite=None is a real, always-explicit policy (modern
+                # Chromium/WebView2 defaults an absent SameSite to Lax, so
+                # this enum is never ambiguous with "unspecified") - str()
+                # on the .NET enum already gives its member name ('None',
+                # 'Lax', 'Strict'), so lowercasing it directly reports
+                # 'none' rather than stripping the attribute via Python
+                # None, which create_cookie() would otherwise treat as
+                # "no SameSite attribute at all".
+                same_site = str(c.SameSite).lower()
                 try:
                     data = {
                         'name': c.Name,
@@ -122,96 +162,178 @@ class EdgeChrome:
                         'expires': c.Expires.ToString('r', CultureInfo.GetCultureInfo('en-US')),
                         'secure': c.IsSecure,
                         'httponly': c.IsHttpOnly,
-                        'samesite': same_site
+                        'samesite': same_site,
                     }
-
                     cookie = create_cookie(data)
                     cookies.append(cookie)
                 except Exception as e:
                     logger.exception(e)
-
             semaphore.release()
 
         _cookies = []
-        self.web_view.CoreWebView2.CookieManager.GetCookiesAsync(self.url).ContinueWith(
-            Action[Task[List[CoreWebView2Cookie]]](_callback), self.syncContextTaskScheduler)
+        self.webview.CoreWebView2.CookieManager.GetCookiesAsync(self.url).ContinueWith(
+            Action[Task[List[CoreWebView2Cookie]]](_callback), self.syncContextTaskScheduler
+        )
 
-
-    def get_current_url(self):
-        return self.url
-
-    def load_html(self, content, base_uri):
+    def load_html(self, content, _):
         self.html = content
         self.ishtml = True
-        self.pywebview_window.events.loaded.clear()
-        
-        if self.web_view.CoreWebView2:
-            self.web_view.CoreWebView2.NavigateToString(self.html)
+
+        if self.webview.CoreWebView2:
+            self.webview.CoreWebView2.NavigateToString(self.html)
         else:
-            self.web_view.EnsureCoreWebView2Async(None)
+            self.webview.EnsureCoreWebView2Async(None)
 
-    def load_url(self, url):
+    def load_url(self, url: str):
         self.ishtml = False
-        self.web_view.Source = Uri(url)
+        self.webview.Source = Uri(url)
 
-    def on_script_notify(self, _, args):
-        try:
-            return_value = args.get_WebMessageAsJson()
-            func_name, func_param, value_id = json.loads(return_value)
-            if func_name == 'alert':
-                WinForms.MessageBox.Show(func_param)
-            elif func_name == 'console':
-                print(func_param)
-            else:
-                js_bridge_call(self.pywebview_window, func_name, func_param, value_id)
-        except Exception as e:
-            logger.exception('Exception occurred during on_script_notify')
+    def _show_alert(self, message: str):
+        WinForms.MessageBox.Show(message)
 
-    def on_new_window_request(self, _, args):
-        args.set_Handled(True)
-        webbrowser.open(str(args.get_Uri()))
+    def _extract_dropped_files(self, additional_objects) -> list:
+        return [
+            (os.path.basename(file.Path), file.Path)
+            for file in list(additional_objects)
+            if 'CoreWebView2File' in str(type(file))
+        ]
 
-    def on_webview_ready(self, sender, args):
-        if not args.IsSuccess:
-            logger.error('WebView2 initialization failed with exception:\n ' + str(args.InitializationException))
-            return
-
-        sender.CoreWebView2.NewWindowRequested += self.on_new_window_request
-        settings = sender.CoreWebView2.Settings
-        settings.AreBrowserAcceleratorKeysEnabled = _debug['mode']
-        settings.AreDefaultContextMenusEnabled = _debug['mode']
+    def _apply_settings(self, settings):
+        settings.AreBrowserAcceleratorKeysEnabled = _state['debug']
+        settings.AreDefaultContextMenusEnabled = _state['debug']
         settings.AreDefaultScriptDialogsEnabled = True
-        settings.AreDevToolsEnabled = _debug['mode']
+        settings.AreDevToolsEnabled = _state['debug']
         settings.IsBuiltInErrorPageEnabled = True
         settings.IsScriptEnabled = True
         settings.IsWebMessageEnabled = True
-        settings.IsStatusBarEnabled = _debug['mode']
+        settings.IsStatusBarEnabled = _state['debug']
+        settings.IsSwipeNavigationEnabled = False
         settings.IsZoomControlEnabled = True
+        if _state['user_agent']:
+            settings.UserAgent = _state['user_agent']
 
-        if _user_agent:
-            settings.UserAgent = _user_agent
+    def on_certificate_error(self, _, args):
+        args.set_Action(CoreWebView2ServerCertificateErrorAction.AlwaysAllow)
 
-        if _private_mode:
-            # cookies persist even if UserDataFolder is in memory. We have to delete cookies manually.
+    def on_script_notify(self, _, args):
+        try:
+            self._route_script_message(args.get_WebMessageAsJson(), args.get_AdditionalObjects)
+        except Exception:
+            logger.exception('Exception occurred during on_script_notify')
+
+    def on_new_window_request(self, sender, args):
+        args.set_Handled(True)
+        self._handle_new_window_request(str(args.get_Uri()))
+
+    def on_source_changed(self, sender, args):
+        self.url = sender.Source
+        self.ishtml = False
+
+    def on_webview_ready(self, sender, args):
+        if not args.IsSuccess:
+            logger.error(
+                'WebView2 initialization failed with exception:\n '
+                + str(args.InitializationException)
+            )
+            return
+
+        self.webview.CoreWebView2.SourceChanged += self.on_source_changed
+        sender.CoreWebView2.NewWindowRequested += self.on_new_window_request
+        sender.CoreWebView2.AddWebResourceRequestedFilter('*', CoreWebView2WebResourceContext.All)
+        sender.CoreWebView2.WebResourceResponseReceived += self.on_web_resource_response
+        sender.CoreWebView2.WebResourceRequested += self.on_web_resource_request
+
+        if self._should_ignore_ssl():
+            sender.CoreWebView2.ServerCertificateErrorDetected += self.on_certificate_error
+
+        sender.CoreWebView2.DownloadStarting += self.on_download_starting
+
+        self._apply_settings(sender.CoreWebView2.Settings)
+
+        if _state['private_mode']:
             sender.CoreWebView2.CookieManager.DeleteAllCookies()
 
-        if self.html:
-            sender.CoreWebView2.NavigateToString(self.html)
+        kind, content = self._get_initial_load()
+        if kind == 'url':
+            self.load_url(content)
+        else:
+            self.load_html(content, '')
 
-        if _debug['mode']:
+        if _state['debug'] and webview_settings['OPEN_DEVTOOLS_IN_DEBUG']:
             sender.CoreWebView2.OpenDevToolsWindow()
 
+    def on_download_starting(self, sender, args):
+        if not self._should_allow_download():
+            args.Cancel = True
+            return
+
+        dialog = WinForms.SaveFileDialog()
+        initial_dir = self._get_download_initial_dir()
+        if initial_dir:
+            dialog.InitialDirectory = initial_dir
+        dialog.Filter = (
+            self.pywebview_window.localization['windows.fileFilter.allFiles'] + ' (*.*)|*.*'
+        )
+        dialog.RestoreDirectory = True
+        dialog.FileName = os.path.basename(args.ResultFilePath)
+
+        result = dialog.ShowDialog(self.form)
+        if result == WinForms.DialogResult.OK:
+            args.ResultFilePath = dialog.FileName
+        else:
+            args.Cancel = True
 
     def on_navigation_start(self, sender, args):
-        pass
+        if self.pywebview_window.transparent:
+            self.form.Show()
+            self.form.Activate()
 
-    def on_navigation_completed(self, sender, args):
+    def on_web_resource_response(self, sender, args):
+        headers = {header.Key: header.Value for header in args.Response.Headers.GetEnumerator()}
+        self._fire_response_event(str(args.Request.Uri), args.Response.StatusCode, headers)
+
+    def on_web_resource_request(self, sender, args):
+        if not len(self.pywebview_window.events.request_sent):
+            return
+
+        original_headers = {
+            header.Key: header.Value for header in args.Request.Headers.GetEnumerator()
+        }
+        uri = str(args.Request.Uri)
+        method = args.Request.Method
+        deferral = args.GetDeferral()
+
+        def dispatch_event():
+            try:
+                diff = self._compute_request_header_diff(original_headers, uri, method)
+            except Exception:
+                logger.exception('Error handling web resource request')
+                diff = None
+
+            def apply_header_diff():
+                try:
+                    if diff is not None:
+                        extra, missing = diff
+                        for key, value in extra.items():
+                            args.Request.Headers.SetHeader(key, value)
+                        for key in missing:
+                            args.Request.Headers.RemoveHeader(key)
+                finally:
+                    deferral.Complete()
+
+            try:
+                self.webview.BeginInvoke(Func[Type](apply_header_diff))
+            except Exception:
+                logger.exception('Error applying web resource request headers')
+                deferral.Complete()
+
+        self._dispatch_request_event(dispatch_event)
+
+    def on_navigation_completed(self, sender, _):
         url = str(sender.Source)
         self.url = None if self.ishtml else url
+        inject_pywebview(renderer, self.pywebview_window)
 
-        self.web_view.ExecuteScriptAsync(parse_api_js(self.pywebview_window, 'chromium'))
 
-        if not self.pywebview_window.text_select:
-            self.web_view.ExecuteScriptAsync(disable_text_select)
-
-        self.pywebview_window.events.loaded.set()
+# Backward-compatible alias used by winforms.py
+EdgeChrome = WinFormsEdgeChrome

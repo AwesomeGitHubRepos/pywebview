@@ -1,9 +1,3 @@
-## Microsoft.Web.WebView2
-
-* Microsoft.Web.WebView2.Core.dll
-* Microsoft.Web.WebView2.WinForms.dll
-* WebView2Loader.dll
-
 Copyright (C) Microsoft Corporation. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without

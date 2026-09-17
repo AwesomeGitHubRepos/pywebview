@@ -1,10 +1,8 @@
+"""
+Create a loading animation that is displayed before application is loaded.
+"""
+
 import webview
-import threading
-
-"""
-This example demonstrates a simple loading animation workflow
-"""
-
 
 html = """
     <style>

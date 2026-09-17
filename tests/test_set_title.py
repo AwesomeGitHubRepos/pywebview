@@ -1,4 +1,5 @@
 import webview
+
 from .util import run_test
 
 
@@ -8,5 +9,7 @@ def test_set_title():
 
 
 def set_title(window):
-    window.set_title('New title')
+    assert window.title == 'Set title test'
+    window.title = 'New title'
 
+    assert window.title == 'New title'

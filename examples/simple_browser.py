@@ -1,8 +1,6 @@
-import webview
+"""The most basic example of creating a webview window."""
 
-"""
-This example demonstrates how to create a webview window.
-"""
+import webview
 
 if __name__ == '__main__':
     # Create a standard webview window

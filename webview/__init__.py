@@ -1,9 +1,6 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-
-
 """
 pywebview is a lightweight cross-platform wrapper around a webview component that allows to display HTML content in its
-own dedicated window. Works on Windows, OS X and Linux and compatible with Python 2 and 3.
+own dedicated window. Works on Windows, OS X, Linux and Android.
 
 (C) 2014-2019 Roman Sirokov and contributors
 Licensed under BSD license
@@ -11,70 +8,177 @@ Licensed under BSD license
 http://github.com/r0x0r/pywebview/
 """
 
+from __future__ import annotations
 
 import datetime
+import enum
 import logging
 import os
 import re
 import tempfile
 import threading
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any, cast
 from uuid import uuid4
+
 from proxy_tools import module_property
 
 import webview.http as http
-
-from webview.guilib import initialize
-from webview.util import _token, base_uri, parse_file_type, is_app, is_local_url, escape_string, escape_line_breaks, WebViewException
+from webview.errors import JavascriptException, WebViewException
+from webview.event import Event
+from webview.guilib import GUIType, initialize
+from webview.localization import original_localization
+from webview.menu import Menu
+from webview.screen import Screen
+from webview.util import _TOKEN, ImmutableDict, abspath, is_app, is_local_url
 from webview.window import Window
-from .localization import original_localization
-
 
 __all__ = (
     # Stuff that's here
-    'start', 'create_window', 'token', 'screens',
+    'active_window',
+    'start',
+    'create_window',
+    'token',
+    'renderer',
+    'screens',
+    'settings',
     # From event
     'Event',
-    # from util
-    '_token', 'base_uri', 'parse_file_type', 'escape_string',
-    'escape_line_breaks', 'WebViewException',
+    # from util    '
+    'JavascriptException',
+    'WebViewException',
     # from screen
     'Screen',
     # from window
     'Window',
 )
 
-logger = logging.getLogger('pywebview')
-handler = logging.StreamHandler()
-formatter = logging.Formatter('[pywebview] %(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
 
-log_level = logging.DEBUG if os.environ.get('PYWEBVIEW_LOG') == 'debug' else logging.INFO
-logger.setLevel(log_level)
+def _setup_logger() -> logging.Logger:
+    """Setup logger with console handler and appropriate log level."""
 
-OPEN_DIALOG = 10
-FOLDER_DIALOG = 20
-SAVE_DIALOG = 30
+    logger = logging.getLogger('pywebview')
 
-DRAG_REGION_SELECTOR = '.pywebview-drag-region'
-DEFAULT_HTTP_PORT = 42001
+    # Avoid duplicate setup
+    if logger.handlers:
+        return logger
+
+    # Create and configure handler
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('[pywebview] %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    # Set log level from environment variable with validation
+    log_level_name = os.environ.get('PYWEBVIEW_LOG', 'INFO').upper()
+    try:
+        log_level = getattr(logging, log_level_name)
+        logger.setLevel(log_level)
+    except AttributeError:
+        # Fallback to INFO if invalid level specified
+        logger.setLevel(logging.INFO)
+        logger.warning(f"Invalid log level '{log_level_name}', using INFO instead")
+
+    return logger
+
+
+logger = _setup_logger()
+
+
+@module_property
+def OPEN_DIALOG():
+    logger.warning(
+        "OPEN_DIALOG is deprecated and will be removed in a future version. Use 'FileDialog.OPEN' instead."
+    )
+    return 10
+
+
+@module_property
+def FOLDER_DIALOG():
+    logger.warning(
+        "FOLDER_DIALOG is deprecated and will be removed in a future version. Use 'FileDialog.FOLDER' instead."
+    )
+    return 20
+
+
+@module_property
+def SAVE_DIALOG():
+    logger.warning(
+        "SAVE_DIALOG is deprecated and will be removed in a future version. Use 'FileDialog.SAVE' instead."
+    )
+    return 30
+
+
+class FileDialog(enum.IntEnum):
+    OPEN = 10
+    FOLDER = 20
+    SAVE = 30
+
+
+settings = ImmutableDict(
+    {
+        'ALLOW_DOWNLOADS': False,
+        'ALLOW_FILE_URLS': True,
+        'DRAG_REGION_SELECTOR': '.pywebview-drag-region',
+        'DRAG_REGION_DIRECT_TARGET_ONLY': False,
+        'DEFAULT_HTTP_PORT': 42001,
+        'OPEN_EXTERNAL_LINKS_IN_BROWSER': True,
+        'OPEN_DEVTOOLS_IN_DEBUG': True,
+        'REMOTE_DEBUGGING_PORT': None,
+        'IGNORE_SSL_ERRORS': False,
+        'JS_API_MAX_DEPTH': 10,
+        'SHOW_DEFAULT_MENUS': True,
+        'WEBVIEW2_RUNTIME_PATH': None,
+    }
+)
+
+
+_state = ImmutableDict(
+    {
+        'debug': False,
+        'storage_path': None,
+        'private_mode': True,
+        'user_agent': None,
+        'http_server': False,
+        'ssl': False,
+        'icon': None,
+        'menu': None,
+    }
+)
+
+
+@module_property
+def DRAG_REGION_SELECTOR():
+    logger.warning(
+        'DRAG_REGION_SELECTOR is deprecated and will be removed in a future version. Use \'settings["DRAG_REGION_SELECTOR"]\' instead.'
+    )
+    return settings['DRAG_REGION_SELECTOR']
+
 
 guilib = None
-_debug = {
-  'mode': False
-}
-_user_agent = None
-_http_server = False
-_private_mode = True
-_storage_path = None
 
-token = _token
-windows = []
-menus = []
+token = _TOKEN
+windows: list[Window] = []
+renderer: str | None = None
 
-def start(func=None, args=None, localization={}, gui=None, debug=False, http_server=False,
-          http_port=None, user_agent=None, private_mode=True, storage_path=None, menu=[], 
-          server=http.BottleServer, server_args={}, ssl=False):
+
+def start(
+    func: Callable[..., None] | None = None,
+    args: Iterable[Any] | None = None,
+    localization: dict[str, str] | None = None,
+    gui: GUIType | None = None,
+    debug: bool = False,
+    http_server: bool = False,
+    http_port: int | None = None,
+    user_agent: str | None = None,
+    private_mode: bool = True,
+    storage_path: str | None = None,
+    menu: list[Menu] | None = None,
+    server: type[http.BottleServer] = http.BottleServer,
+    server_args: dict[Any, Any] | None = None,
+    ssl: bool = False,
+    icon: str | None = None,
+):
     """
     Start a GUI loop and display previously created windows. This function must
     be called from a main thread.
@@ -84,22 +188,29 @@ def start(func=None, args=None, localization={}, gui=None, debug=False, http_ser
         values.
     :param localization: A dictionary with localized strings. Default strings
         and their keys are defined in localization.py.
-    :param gui: Force a specific GUI. Allowed values are ``cef``, ``qt``, or
-        ``gtk`` depending on a platform.
+    :param gui: Force a specific GUI. Allowed values are ``cef``, ``qt``,
+        ``gtk``, ``mshtml``, ``edgechromium`` or ``winui3`` depending on a platform.
     :param debug: Enable debug mode. Default is False.
     :param http_server: Enable built-in HTTP server. If enabled, local files
         will be served using a local HTTP server on a random port. For each
         window, a separate HTTP server is spawned. This option is ignored for
         non-local URLs.
-    :param user_agent: Change user agent string. Not supported in EdgeHTML.
+    :param user_agent: Change user agent string.
     :param private_mode: Enable private mode. In private mode, cookies and local storage are not preserved.
            Default is True.
     :param storage_path: Custom location for cookies and other website data
     :param menu: List of menus to be included in the app menu
     :param server: Server class. Defaults to BottleServer
     :param server_args: Dictionary of arguments to pass through to the server instantiation
+    :param ssl: Enable SSL for local HTTP server. Default is False.
+    :param icon: Path to the icon file. Supported on GTK, QT, macOS and Windows.
     """
-    global guilib, _debug, _http_server, _user_agent, _private_mode, _storage_path
+    global guilib, renderer
+
+    localization = localization if localization is not None else {}
+    menu = menu if menu is not None else []
+    server_args = server_args if server_args is not None else {}
+    generated_ssl_cert = False
 
     def _create_children(other_windows):
         if not windows[0].events.shown.wait(10):
@@ -108,18 +219,26 @@ def start(func=None, args=None, localization={}, gui=None, debug=False, http_ser
         for window in other_windows:
             guilib.create_window(window)
 
-    _debug['mode'] = debug
+    _state['debug'] = debug
+    _state['user_agent'] = user_agent
+    _state['http_server'] = http_server
+    _state['private_mode'] = private_mode
 
-    if debug:
+    if icon:
+        _state['icon'] = abspath(icon)
+
+    if storage_path:
+        __set_storage_path(storage_path)
+
+    if debug and not os.environ.get('PYWEBVIEW_LOG'):
         logger.setLevel(logging.DEBUG)
 
-    _user_agent = user_agent
-    _http_server = http_server
-    _private_mode = private_mode
-    _storage_path = storage_path
-
-    if _storage_path and _private_mode and not os.path.exists(_storage_path):
-        os.makedirs(_storage_path)
+    if (
+        _state['storage_path']
+        and _state['private_mode']
+        and not os.path.exists(_state['storage_path'])
+    ):
+        os.makedirs(_state['storage_path'])
 
     original_localization.update(localization)
 
@@ -129,166 +248,275 @@ def start(func=None, args=None, localization={}, gui=None, debug=False, http_ser
     if len(windows) == 0:
         raise WebViewException('You must create a window first before calling this function.')
 
+    if menu:
+        _state['menu'] = menu
+
     guilib = initialize(gui)
-    
+    renderer = guilib.renderer
+
     if ssl:
-      # generate SSL certs and tell the windows to use them
-      keyfile, certfile = generate_ssl_cert()
-      server_args['keyfile'] = keyfile
-      server_args['certfile'] = certfile
+        if not server_args or 'keyfile' not in server_args or 'certfile' not in server_args:
+            # generate SSL certs and tell the windows to use them
+            keyfile, certfile = __generate_ssl_cert()
+            generated_ssl_cert = True
+            server_args['keyfile'] = keyfile
+            server_args['certfile'] = certfile
+        else:
+            keyfile = server_args['keyfile']
+            certfile = server_args['certfile']
+            if not os.path.exists(keyfile):
+                raise WebViewException(f'The {keyfile} does not exist.')
+            if not os.path.exists(certfile):
+                raise WebViewException(f'The {certfile} does not exist.')
+
+        _state['ssl'] = True
     else:
-      keyfile, certfile = None, None
+        keyfile, certfile = None, None
+        server_args.pop('keyfile', None)
+        server_args.pop('certfile', None)
 
-    urls = [w.original_url for w in windows]
-    has_local_urls = not not [
-        w.original_url
-        for w in windows
-        if is_local_url(w.original_url)
+    urls: list[str | Callable[..., Any]] = [
+        w.original_url for w in windows if isinstance(w.original_url, str)
     ]
+    has_local_urls = not not [w.original_url for w in windows if is_local_url(w.original_url)]
     # start the global server if it's not running and we need it
-    if (http.global_server is None) and \
-        (http_server or has_local_urls or (guilib.renderer == 'gtkwebkit2')):
-            if not _private_mode and not http_port:
-                http_port = DEFAULT_HTTP_PORT
-            prefix, common_path, server = http.start_global_server(http_port=http_port, urls=urls, server=server, ssl=ssl, **server_args)
+    if (http.global_server is None) and (http_server or has_local_urls):
+        if not _state['private_mode'] and not http_port:
+            http_port = settings['DEFAULT_HTTP_PORT']
+        http.start_global_server(http_port=http_port, urls=urls, server=server, **server_args)
 
-    for window in windows:            
-        window._initialize(guilib)
+    for window in windows:
+        should_initialize = not window._initialize(
+            guilib, server_args=cast(http.ServerArgs, server_args)
+        )
+        if should_initialize:
+            return
 
     if ssl:
-      for window in windows:
-        window.gui.add_tls_cert(certfile)
+        for window in windows:
+            window.gui.add_tls_cert(certfile)
 
     if len(windows) > 1:
-        t = threading.Thread(target=_create_children, args=(windows[1:],))
-        t.start()
+        thread = threading.Thread(target=_create_children, args=(windows[1:],))
+        thread.start()
 
     if func:
         if args is not None:
             if not hasattr(args, '__iter__'):
                 args = (args,)
-            t = threading.Thread(target=func, args=args)
+            thread = threading.Thread(target=func, args=args)
         else:
-            t = threading.Thread(target=func)
-        t.start()
+            thread = threading.Thread(target=func)
+        thread.start()
 
-    if menu:
-        guilib.set_app_menu(menu)
-    guilib.create_window(windows[0])
-    # keyfile is deleted by the ServerAdapter right after wrap_socket()
-    if certfile:
-      os.unlink(certfile)
+    try:
+        guilib.create_window(windows[0])
+    finally:
+        if generated_ssl_cert:
+            for path in (keyfile, certfile):
+                if path and os.path.exists(path):
+                    os.unlink(path)
 
 
-def create_window(title, url=None, html=None, js_api=None, width=800, height=600, x=None, y=None,
-                  resizable=True, fullscreen=False, min_size=(200, 100), hidden=False,
-                  frameless=False, easy_drag=True,
-                  minimized=False, on_top=False, confirm_close=False, background_color='#FFFFFF',
-                  transparent=False, text_select=False, zoomable=False, draggable=False, vibrancy=False, localization=None,
-                  server=http.BottleServer, http_port=None, server_args={}):
+def create_window(
+    title: str,
+    url: str | Callable[..., Any] | None = None,
+    html: str | None = None,
+    js_api: Any = None,
+    width: int = 800,
+    height: int = 600,
+    x: int | None = None,
+    y: int | None = None,
+    screen: Screen | None = None,
+    resizable: bool = True,
+    fullscreen: bool = False,
+    min_size: tuple[int, int] = (200, 100),
+    hidden: bool = False,
+    frameless: bool = False,
+    easy_drag: bool = True,
+    shadow: bool = True,
+    focus: bool = True,
+    minimized: bool = False,
+    maximized: bool = False,
+    on_top: bool = False,
+    confirm_close: bool = False,
+    background_color: str = '#FFFFFF',
+    transparent: bool = False,
+    text_select: bool = False,
+    zoomable: bool = False,
+    draggable: bool = False,
+    vibrancy: bool = False,
+    menu: list[Menu] | None = None,
+    localization: Mapping[str, str] | None = None,
+    server: type[http.BottleServer] = http.BottleServer,
+    http_port: int | None = None,
+    server_args: http.ServerArgs | None = None,
+) -> Window | None:
     """
     Create a web view window using a native GUI. The execution blocks after this function is invoked, so other
     program logic must be executed in a separate thread.
     :param title: Window title
-    :param url: URL to load
+    :param url: URL or WSGI/ASGI app to load
+    :param html: HTML content to load
     :param width: window width. Default is 800px
-    :param height:window height. Default is 600px
-    :param resizable True if window can be resized, False otherwise. Default is True
+    :param height: window height. Default is 600px
+    :param screen: Screen to display the window on.
+    :param resizable: True if window can be resized, False otherwise. Default is True
     :param fullscreen: True if start in fullscreen mode. Default is False
     :param min_size: a (width, height) tuple that specifies a minimum window size. Default is 200x100
     :param hidden: Whether the window should be hidden.
     :param frameless: Whether the window should have a frame.
     :param easy_drag: Easy window drag mode when window is frameless.
+    :param shadow: Whether the window should have a frame border (shadows and Windows rounded edges).
+    :param focus: Whether to activate the window when user opens it. Window can be controlled with mouse but keyboard input will go to another (active) window and not this one.
     :param minimized: Display window minimized
+    :param maximized: Display window maximized
     :param on_top: Keep window above other windows (required OS: Windows)
     :param confirm_close: Display a window close confirmation dialog. Default is False
     :param background_color: Background color as a hex string that is displayed before the content of webview is loaded. Default is white.
     :param text_select: Allow text selection on page. Default is False.
     :param transparent: Don't draw window background.
+    :param menu: List of menus to be included in the window menu
     :param server: Server class. Defaults to BottleServer
     :param server_args: Dictionary of arguments to pass through to the server instantiation
-    :return: window object.
+    :return: window object or None if window initialization is cancelled in the window.events.initialized event
     """
 
     valid_color = r'^#(?:[0-9a-fA-F]{3}){1,2}$'
     if not re.match(valid_color, background_color):
-        raise ValueError('{0} is not a valid hex triplet color'.format(background_color))
+        raise ValueError(f'{background_color} is not a valid hex triplet color')
+
+    server_args = server_args if server_args is not None else {}
 
     uid = 'master' if len(windows) == 0 else 'child_' + uuid4().hex[:8]
 
-    window = Window(uid, title, url, html,
-                    width, height, x, y, resizable, fullscreen, min_size, hidden,
-                    frameless, easy_drag, minimized, on_top, confirm_close, background_color,
-                    js_api, text_select, transparent, zoomable, draggable, vibrancy, localization,
-                    server=server, http_port=http_port, server_args=server_args)
+    window = Window(
+        uid,
+        title,
+        url,
+        html or '',
+        width,
+        height,
+        x,
+        y,
+        resizable,
+        fullscreen,
+        min_size,
+        hidden,
+        frameless,
+        easy_drag,
+        shadow,
+        focus,
+        minimized,
+        maximized,
+        on_top,
+        confirm_close,
+        background_color,
+        js_api,
+        text_select,
+        transparent,
+        zoomable,
+        draggable,
+        vibrancy,
+        menu,
+        localization,
+        server=server,
+        http_port=http_port,
+        server_args=server_args,
+        screen=screen,
+    )
 
     windows.append(window)
 
     # This immediately creates the window only if `start` has already been called
     if threading.current_thread().name != 'MainThread' and guilib:
-        if is_app(url) or is_local_url(url) and not server.is_running:
-            url_prefix, common_path, server = http.start_server([url], server=server, **server_args)
+        server_instance: http.BottleServer | None
+        if is_app(url) or is_local_url(url):
+            # Start a dedicated server for this URL. The global server serves
+            # from its original root_path, so reusing it would 404 for a local
+            # file that lives outside that root.
+            _, _, server_instance = http.start_server([url], server=server, **server_args)
         else:
-            url_prefix, common_path, server = None, None, None
+            server_instance = None
 
-        window._initialize(gui = guilib, server = server)
+        if not window._initialize(gui=guilib, server=server_instance):
+            return None
         guilib.create_window(window)
 
     return window
-    
-def generate_ssl_cert():
-    # https://cryptography.io/en/latest/x509/tutorial/#creating-a-self-signed-certificate
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.hazmat.primitives import serialization
-    from cryptography import x509
-    from cryptography.x509.oid import NameOID
-    from cryptography.hazmat.primitives import hashes
-    
+
+
+def __generate_ssl_cert() -> tuple[str, str]:
+    try:
+        # https://cryptography.io/en/latest/x509/tutorial/#creating-a-self-signed-certificate
+        from cryptography import x509
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        raise WebViewException(
+            'SSL support requires cryptography package. Please install it with "pip install cryptography" or "pip install pywebview[ssl]"'
+        )
+
     with tempfile.NamedTemporaryFile(prefix='keyfile_', suffix='.pem', delete=False) as f:
-      keyfile = f.name
-      key = rsa.generate_private_key(
-          public_exponent=65537,
-          key_size=2048,
-      )
-      key_pem = key.private_bytes(
-          encoding=serialization.Encoding.PEM,
-          format=serialization.PrivateFormat.TraditionalOpenSSL,
-          encryption_algorithm=serialization.NoEncryption(), #BestAvailableEncryption(b"passphrase"),
-      )
-      f.write(key_pem)
-      
-    
+        keyfile = f.name
+        key = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048, backend=default_backend()
+        )
+        key_pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),  # BestAvailableEncryption(b"passphrase"),
+        )
+        f.write(key_pem)
+
     with tempfile.NamedTemporaryFile(prefix='certfile_', suffix='.pem', delete=False) as f:
-      certfile = f.name
-      subject = issuer = x509.Name([
-          x509.NameAttribute(NameOID.COUNTRY_NAME, u"US"),
-          x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"California"),
-          x509.NameAttribute(NameOID.LOCALITY_NAME, u"San Francisco"),
-          x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"pywebview"),
-          x509.NameAttribute(NameOID.COMMON_NAME, u"127.0.0.1"),
-      ])
-      cert = x509.CertificateBuilder().subject_name(
-          subject
-      ).issuer_name(
-          issuer
-      ).public_key(
-          key.public_key()
-      ).serial_number(
-          x509.random_serial_number()
-      ).not_valid_before(
-          datetime.datetime.utcnow()
-      ).not_valid_after(
-          datetime.datetime.utcnow() + datetime.timedelta(days=365)
-      ).add_extension(
-          x509.SubjectAlternativeName([x509.DNSName(u"localhost")]),
-          critical=False,
-      ).sign(key, hashes.SHA256())
-      cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-      f.write(cert_pem)
+        certfile = f.name
+        subject = issuer = x509.Name(
+            [
+                x509.NameAttribute(NameOID.COUNTRY_NAME, 'US'),
+                x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, 'California'),
+                x509.NameAttribute(NameOID.LOCALITY_NAME, 'San Francisco'),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'pywebview'),
+                x509.NameAttribute(NameOID.COMMON_NAME, '127.0.0.1'),
+            ]
+        )
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.utcnow())
+            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+            .add_extension(
+                x509.SubjectAlternativeName([x509.DNSName('localhost')]),
+                critical=False,
+            )
+            .sign(key, hashes.SHA256(), backend=default_backend())
+        )
+        cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+        f.write(cert_pem)
 
     return keyfile, certfile
 
-def active_window():
+
+def __set_storage_path(storage_path: str) -> None:
+    e = WebViewException(f'Storage path {storage_path} is not writable')
+
+    if not os.path.exists(storage_path):
+        try:
+            os.makedirs(storage_path)
+        except OSError:
+            raise e
+    if not os.access(storage_path, os.W_OK):
+        raise e
+
+    _state['storage_path'] = storage_path
+
+
+def active_window() -> Window | None:
     """
     Get the active window
 
@@ -298,9 +526,14 @@ def active_window():
         return guilib.get_active_window()
     return None
 
+
 @module_property
-def screens():
-    guilib = initialize()
+def screens() -> list[Screen]:
+    global renderer, guilib
+
+    if not guilib:
+        guilib = initialize()
+        renderer = guilib.renderer
+
     screens = guilib.get_screens()
     return screens
-

@@ -1,8 +1,11 @@
+"""Subscribe and unsubscribe to pywebview events."""
+
 import webview
-import time
-"""
-This example demonstrates how to handle pywebview events.
-"""
+
+
+def on_before_show(window):
+    print('Native window object', window.native)
+
 
 def on_closed():
     print('pywebview window is closed')
@@ -10,6 +13,11 @@ def on_closed():
 
 def on_closing():
     print('pywebview window is closing')
+
+
+def on_initialized(renderer):
+    # return False to cancel initialization
+    print(f'GUI is initialized with renderer: {renderer}')
 
 
 def on_shown():
@@ -29,26 +37,31 @@ def on_maximized():
 
 
 def on_resized(width, height):
-    print('pywebview window is resized. new dimensions are {width} x {height}'.format(width=width, height=height))
+    print(f'pywebview window is resized. new dimensions are {width} x {height}')
 
 
-def on_loaded():
+# you can supply optional window argument to access the window object event was triggered on
+def on_loaded(window):
     print('DOM is ready')
 
     # unsubscribe event listener
-    webview.windows[0].events.loaded -= on_loaded
-    webview.windows[0].load_url('https://pywebview.flowrl.com/hello')
+    window.events.loaded -= on_loaded
+    window.load_url('https://pywebview.flowrl.com/hello')
 
 
 def on_moved(x, y):
-    print('pywebview window is moved. new coordinates are x: {x}, y: {y}'.format(x=x, y=y))
+    print(f'pywebview window is moved. new coordinates are x: {x}, y: {y}')
 
 
 if __name__ == '__main__':
-    window = webview.create_window('Simple browser', 'https://pywebview.flowrl.com/', confirm_close=True)
+    window = webview.create_window(
+        'Simple browser', 'https://pywebview.flowrl.com/', confirm_close=True
+    )
 
     window.events.closed += on_closed
     window.events.closing += on_closing
+    window.events.before_show += on_before_show
+    window.events.initialized += on_initialized
     window.events.shown += on_shown
     window.events.loaded += on_loaded
     window.events.minimized += on_minimized
@@ -57,4 +70,4 @@ if __name__ == '__main__':
     window.events.resized += on_resized
     window.events.moved += on_moved
 
-    webview.start(debug=True)
+    webview.start()

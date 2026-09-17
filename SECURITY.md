@@ -2,14 +2,10 @@
 
 ## Supported Versions
 
-Versions lower than 3.0 are not supported
-
-| Version | Supported          |
-| ------- | ------------------ |
-| 3.x   | :white_check_mark: |
-| < 3.0    | :x:                |
+Only the latest released version of pywebview is supported. See the
+[changelog](https://pywebview.flowrl.com/CHANGELOG) for the current version.
 
 ## Reporting a Vulnerability
 
-If you find a vulnerability in the pywebview code, please get in touch via roman@flowrl.com 
-Please do not report any vulnerabilities in node_modules dependencies of the pywebview website. 
+If you find a vulnerability in the pywebview code, please get in touch via [roman@flowrl.com](mailto:roman@flowrl.com).
+Please do not report any vulnerabilities in the node_modules dependencies of the pywebview website.

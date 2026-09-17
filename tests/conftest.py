@@ -1,8 +1,25 @@
+from importlib import reload
+
 import pytest
-from six.moves import reload_module
 
 
 @pytest.fixture(autouse=True)
 def reload_webview():
     import webview
-    reload_module(webview)
+    from webview import http
+
+    reload(webview)
+    reload(http)
+
+
+@pytest.fixture(autouse=True)
+def set_env():
+    import os
+
+    os.environ['PYWEBVIEW_TEST'] = 'true'
+
+
+# @pytest.fixture(autouse=True)
+# def set_gui():
+#     import os
+#     os.environ['PYWEBVIEW_GUI'] = 'qt'

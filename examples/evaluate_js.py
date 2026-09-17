@@ -1,8 +1,7 @@
-import webview
+"""Run Javascript code from Python."""
 
-"""
-This example demonstrates evaluating JavaScript in a web page.
-"""
+import webview
+from webview.errors import JavascriptException
 
 
 def evaluate_js(window):
@@ -23,7 +22,12 @@ def evaluate_js(window):
 
     print(result)
 
+    try:
+        result = window.evaluate_js('syntaxerror#$%#$')
+    except JavascriptException as e:
+        print('Javascript exception occured: ', e)
+
 
 if __name__ == '__main__':
-    window = webview.create_window('Run custom JavaScript', html='<html><body></body></html>')
+    window = webview.create_window('Evaluate JavaScript', html='<html><body></body></html>')
     webview.start(evaluate_js, window)

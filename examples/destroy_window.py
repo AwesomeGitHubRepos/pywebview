@@ -1,10 +1,10 @@
-import webview
+"""
+Programmatically destroy created window after five seconds.
+"""
+
 import time
 
-"""
-This example demonstrates how a webview window is created and destroyed
-programmatically after 5 seconds.
-"""
+import webview
 
 
 def destroy(window):
